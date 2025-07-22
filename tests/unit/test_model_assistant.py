@@ -94,6 +94,18 @@ class TestModelAssistant:
         assert result == "generated text"
         mock_model.generate.assert_called_once()
 
+    @patch("src.model_assistant.AutoTokenizer")
+    @patch("src.model_assistant.AutoModelForCausalLM")
+    def test_model_loading_failure(self, mock_model, mock_tokenizer):
+        """Test model loading failure raises exception."""
+        mock_tokenizer.from_pretrained.return_value = Mock()
+        mock_model.from_pretrained.side_effect = Exception("Model not found")
+
+        config = ModelAssistantConfig(model_path="nonexistent-model")
+
+        with pytest.raises(Exception, match="Model not found"):
+            ModelAssistant(config)
+
 
 class TestDatasetLoading:
     """Test suite for dataset loading functionality."""
@@ -131,6 +143,14 @@ class TestDatasetLoading:
         first_example = dataset[0]
         assert isinstance(first_example["text"], str)
         assert len(first_example["text"]) > 0
+
+    @patch("src.model_assistant.load_dataset")
+    def test_dataset_loading_failure(self, mock_load_dataset):
+        """Test dataset loading failure raises ValueError."""
+        mock_load_dataset.side_effect = Exception("Dataset not found")
+
+        with pytest.raises(ValueError, match="Could not load dataset"):
+            ModelAssistant.load_dataset_from_path("nonexistent.json")
 
 
 @pytest.fixture
