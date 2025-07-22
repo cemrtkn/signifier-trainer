@@ -41,6 +41,20 @@ class TestLoadConfigFromYaml:
         finally:
             os.unlink(tmp_path)
 
+    def test_empty_yaml_file(self):
+        """Test loading an empty YAML configuration file."""
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".yaml", delete=False
+        ) as tmp_file:
+            tmp_file.write("")  # Empty file
+            tmp_path = tmp_file.name
+
+        try:
+            with pytest.raises(ValidationError):
+                load_config_from_yaml(tmp_path, SampleConfig)
+        finally:
+            os.unlink(tmp_path)
+
     def test_validation_error(self):
         """Test ValidationError when required field is missing."""
         config_data = {"name": "test_app"}  # missing required 'port'
