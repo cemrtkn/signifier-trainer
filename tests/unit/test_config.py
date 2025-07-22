@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from src.config import InferenceConfig, ModelAssistantConfig, TrainingConfig
+from src.utils import load_config_from_yaml
 
 
 class TestModelAssistantConfig:
@@ -50,6 +51,30 @@ class TestTrainingConfig:
 
         with pytest.raises(ValidationError):
             TrainingConfig(dataset_path="test.txt")  # Missing output_dir
+
+    def test_load_example_config_yaml(self):
+        """Test loading the example config from examples directory."""
+        config = load_config_from_yaml(
+            "examples/example_config.yaml", TrainingConfig
+        )
+
+        # Verify basic structure
+        assert config.dataset_path == "examples/sample_data.txt"
+        assert config.output_dir == "./example_trained_model"
+        assert config.max_length == 128
+        assert config.train_test_split == 0.7
+
+        # Verify assistant config
+        assert config.assistant_config.model_path == "gpt2"
+        assert config.assistant_config.generation_params["temperature"] == 0.8
+        assert (
+            config.assistant_config.generation_params["max_new_tokens"] == 30
+        )
+
+        # Verify training args
+        assert config.training_args.num_train_epochs == 1
+        assert config.training_args.per_device_train_batch_size == 2
+        assert config.training_args.output_dir == "./example_trained_model"
 
 
 class TestInferenceConfig:
