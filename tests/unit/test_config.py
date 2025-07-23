@@ -60,7 +60,7 @@ class TestTrainingConfig:
 
         # Verify basic structure
         assert config.dataset_path == "examples/sample_data.txt"
-        assert config.output_dir == "./example_trained_model"
+        assert config.output_dir == "trained_models/<<group_name>>/<<job_name>>"
         assert config.max_length == 128
         assert config.train_test_split == 0.7
 
@@ -74,7 +74,7 @@ class TestTrainingConfig:
         # Verify training args
         assert config.training_args.num_train_epochs == 1
         assert config.training_args.per_device_train_batch_size == 2
-        assert config.training_args.output_dir == "./example_trained_model"
+        assert config.training_args.output_dir == "trained_models/<<group_name>>/<<job_name>>"
 
 
 class TestInferenceConfig:
