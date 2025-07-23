@@ -7,7 +7,6 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import Mock, patch
-from unittest.mock import mock_open, patch
 
 import pytest
 from transformers import TrainingArguments
@@ -129,6 +128,7 @@ class TestLoadAndProcessConfig:
 
         # Verify config loading and overrides
         from config import TrainingConfig as TrainConfigImport
+
         mock_load.assert_called_once_with(TEST_CONFIG_PATH, TrainConfigImport)
         assert result.output_dir == "/custom/output"
         assert result.dataset_path == "/custom/data.txt"
@@ -175,9 +175,10 @@ class TestValidateTrainingSetup:
 
     def test_validation_warns_about_existing_output_dir(self, caplog):
         """Test that validation warns about existing output directory."""
-        with TestHelpers.temp_dataset_and_output(
-            create_output_dir=True
-        ) as (dataset_path, output_dir):
+        with TestHelpers.temp_dataset_and_output(create_output_dir=True) as (
+            dataset_path,
+            output_dir,
+        ):
             config = TestHelpers.create_mock_config(
                 dataset_path=dataset_path,
                 output_dir=output_dir,
@@ -310,9 +311,7 @@ class TestMainFunction:
     @patch("train.validate_training_setup")
     @patch("train.load_and_process_config")
     @patch("train.create_argument_parser")
-    def test_main_verbose_logging(
-        self, mock_parser, mock_load, mock_validate
-    ):
+    def test_main_verbose_logging(self, mock_parser, mock_load, mock_validate):
         """Test that verbose flag enables debug logging."""
         args, config = self._setup_main_mocks()
         args.verbose = True
