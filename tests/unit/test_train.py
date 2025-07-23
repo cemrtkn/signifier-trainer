@@ -7,11 +7,12 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import Mock, patch
+from transformers import TrainingArguments
 
 import pytest
 
-from src.config import TrainingConfig
-from src.train import (
+from config import TrainingConfig
+from train import (
     create_argument_parser,
     execute_training_workflow,
     load_and_process_config,
@@ -39,7 +40,10 @@ class TestHelpers:
         config = Mock(spec=TrainingConfig)
         config.dataset_path = dataset_path
         config.output_dir = output_dir
-        config.training_args = {"overwrite_output_dir": overwrite_output_dir}
+        config.training_args = TrainingArguments(
+            output_dir=output_dir,
+            overwrite_output_dir=overwrite_output_dir,
+        )
         config.assistant_config = Mock()
         return config
 
