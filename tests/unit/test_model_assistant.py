@@ -7,15 +7,15 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from src.config import ModelAssistantConfig
-from src.model_assistant import ModelAssistant
+from config import ModelAssistantConfig
+from model_assistant import ModelAssistant
 
 
 class TestModelAssistant:
     """Test suite for ModelAssistant class."""
 
-    @patch("src.model_assistant.AutoTokenizer")
-    @patch("src.model_assistant.AutoModelForCausalLM")
+    @patch("model_assistant.AutoTokenizer")
+    @patch("model_assistant.AutoModelForCausalLM")
     def test_initialization(self, mock_model, mock_tokenizer):
         """Test ModelAssistant initialization."""
         # Mock the model and tokenizer
@@ -31,9 +31,9 @@ class TestModelAssistant:
         mock_tokenizer.from_pretrained.assert_called_once_with("gpt2")
         mock_model.from_pretrained.assert_called_once_with("gpt2")
 
-    @patch("src.model_assistant.torch.cuda.is_available")
-    @patch("src.model_assistant.AutoTokenizer")
-    @patch("src.model_assistant.AutoModelForCausalLM")
+    @patch("model_assistant.torch.cuda.is_available")
+    @patch("model_assistant.AutoTokenizer")
+    @patch("model_assistant.AutoModelForCausalLM")
     def test_device_auto_detection(
         self, mock_model, mock_tokenizer, mock_cuda
     ):
@@ -48,8 +48,8 @@ class TestModelAssistant:
 
         assert assistant.device.type == "cuda"
 
-    @patch("src.model_assistant.AutoTokenizer")
-    @patch("src.model_assistant.AutoModelForCausalLM")
+    @patch("model_assistant.AutoTokenizer")
+    @patch("model_assistant.AutoModelForCausalLM")
     def test_tokenizer_fallback(self, mock_model, mock_tokenizer):
         """Test tokenizer fallback to GPT-2 when loading fails."""
         # Mock first call to fail, second to succeed
@@ -67,8 +67,8 @@ class TestModelAssistant:
         mock_tokenizer.from_pretrained.assert_any_call("invalid-model")
         mock_tokenizer.from_pretrained.assert_any_call("gpt2")
 
-    @patch("src.model_assistant.AutoTokenizer")
-    @patch("src.model_assistant.AutoModelForCausalLM")
+    @patch("model_assistant.AutoTokenizer")
+    @patch("model_assistant.AutoModelForCausalLM")
     def test_generate_text(self, mock_model_cls, mock_tokenizer_cls):
         """Test text generation functionality."""
         # Setup mocks
@@ -94,8 +94,8 @@ class TestModelAssistant:
         assert result == "generated text"
         mock_model.generate.assert_called_once()
 
-    @patch("src.model_assistant.AutoTokenizer")
-    @patch("src.model_assistant.AutoModelForCausalLM")
+    @patch("model_assistant.AutoTokenizer")
+    @patch("model_assistant.AutoModelForCausalLM")
     def test_model_loading_failure(self, mock_model, mock_tokenizer):
         """Test model loading failure raises exception."""
         mock_tokenizer.from_pretrained.return_value = Mock()
@@ -144,7 +144,7 @@ class TestDatasetLoading:
         assert isinstance(first_example["text"], str)
         assert len(first_example["text"]) > 0
 
-    @patch("src.model_assistant.load_dataset")
+    @patch("model_assistant.load_dataset")
     def test_dataset_loading_failure(self, mock_load_dataset):
         """Test dataset loading failure raises ValueError."""
         mock_load_dataset.side_effect = Exception("Dataset not found")

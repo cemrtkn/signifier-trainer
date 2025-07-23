@@ -3,8 +3,8 @@
 import pytest
 from pydantic import ValidationError
 
-from src.config import InferenceConfig, ModelAssistantConfig, TrainingConfig
-from src.utils import load_config_from_yaml
+from config import InferenceConfig, ModelAssistantConfig, TrainingConfig
+from utils import load_config_from_yaml
 
 
 class TestModelAssistantConfig:

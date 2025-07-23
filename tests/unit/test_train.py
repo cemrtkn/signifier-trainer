@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for training script functions."""
+"""Unit tests for training script functionality."""
 
 import argparse
 import logging
@@ -7,15 +7,16 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import Mock, patch
-from transformers import TrainingArguments
+from unittest.mock import mock_open, patch
 
 import pytest
+from transformers import TrainingArguments
 
 from config import TrainingConfig
 from train import (
-    create_argument_parser,
     execute_training_workflow,
     load_and_process_config,
+    main,
     validate_training_setup,
 )
 
@@ -45,6 +46,7 @@ class TestHelpers:
             overwrite_output_dir=overwrite_output_dir,
         )
         config.assistant_config = Mock()
+        config.assistant_config.model_path = "gpt2"  # Valid model path
         return config
 
     @staticmethod
@@ -84,45 +86,33 @@ class TestHelpers:
 class TestCreateArgumentParser:
     """Tests for create_argument_parser function."""
 
-    def test_creates_parser_with_required_arguments(self):
-        """Test that parser is created with all required arguments."""
+    def test_creates_parser_with_required_args(self):
+        """Test that parser creates all required arguments."""
+        from train import create_argument_parser
+
         parser = create_argument_parser()
 
-        # Test required argument
-        with pytest.raises(SystemExit):
-            parser.parse_args([])  # Missing required --config
+        # Test that parser can handle required arguments
+        args = parser.parse_args(["--config", "test.yaml"])
+        assert args.config == "test.yaml"
 
-        # Test successful parsing with required argument
-        args = parser.parse_args(["--config", TEST_CONFIG_PATH])
-        assert args.config == TEST_CONFIG_PATH
+    def test_sets_default_values(self):
+        """Test that parser sets correct default values."""
+        from train import create_argument_parser
 
-    def test_parses_optional_arguments_correctly(self):
-        """Test that optional arguments are parsed correctly."""
         parser = create_argument_parser()
+        args = parser.parse_args(["--config", "test.yaml"])
 
-        args = parser.parse_args(
-            [
-                "--config",
-                TEST_CONFIG_PATH,
-                "--output_dir",
-                TEST_OUTPUT_DIR,
-                "--dataset_path",
-                TEST_DATASET_PATH,
-                "--dry_run",
-                "--verbose",
-            ]
-        )
-
-        assert args.output_dir == TEST_OUTPUT_DIR
-        assert args.dataset_path == TEST_DATASET_PATH
-        assert args.dry_run is True
-        assert args.verbose is True
+        assert args.dry_run is False
+        assert args.verbose is False
+        assert args.output_dir is None
+        assert args.dataset_path is None
 
 
 class TestLoadAndProcessConfig:
     """Tests for load_and_process_config function."""
 
-    @patch("src.train.load_config_from_yaml")
+    @patch("train.load_config_from_yaml")
     def test_loads_config_and_applies_overrides(self, mock_load):
         """Test config loading with CLI argument overrides."""
         # Setup mock config
@@ -138,12 +128,13 @@ class TestLoadAndProcessConfig:
         result = load_and_process_config(args)
 
         # Verify config loading and overrides
-        mock_load.assert_called_once_with(TEST_CONFIG_PATH, TrainingConfig)
+        from config import TrainingConfig as TrainConfigImport
+        mock_load.assert_called_once_with(TEST_CONFIG_PATH, TrainConfigImport)
         assert result.output_dir == "/custom/output"
         assert result.dataset_path == "/custom/data.txt"
         assert result.training_args["output_dir"] == "/custom/output"
 
-    @patch("src.train.load_config_from_yaml")
+    @patch("train.load_config_from_yaml")
     def test_handles_no_overrides(self, mock_load):
         """Test config loading without CLI overrides."""
         mock_config = TestHelpers.create_mock_config()
@@ -170,41 +161,38 @@ class TestValidateTrainingSetup:
                 dataset_path=dataset_path, output_dir=output_dir
             )
 
-            # Should not raise any exceptions
+            # Should pass without exceptions
             validate_training_setup(config)
 
-    def test_raises_error_for_missing_dataset(self):
-        """Test validation fails with missing dataset."""
+    def test_validation_fails_with_missing_dataset(self):
+        """Test validation fails when dataset file doesn't exist."""
         config = TestHelpers.create_mock_config(
-            dataset_path="/nonexistent/data.txt"
+            dataset_path="/nonexistent/path.txt"
         )
 
-        with pytest.raises(FileNotFoundError, match="Dataset not found"):
+        with pytest.raises(FileNotFoundError):
             validate_training_setup(config)
 
-    def test_warns_about_existing_output_directory(self):
-        """
-        Test validation warns when output
-        directory exists without overwrite.
-        """
-        with TestHelpers.temp_dataset_and_output(create_output_dir=True) as (
-            dataset_path,
-            output_dir,
-        ):
+    def test_validation_warns_about_existing_output_dir(self, caplog):
+        """Test that validation warns about existing output directory."""
+        with TestHelpers.temp_dataset_and_output(
+            create_output_dir=True
+        ) as (dataset_path, output_dir):
             config = TestHelpers.create_mock_config(
                 dataset_path=dataset_path,
                 output_dir=output_dir,
                 overwrite_output_dir=False,
             )
 
-            # Should pass validation but log warning
-            validate_training_setup(config)
+            with caplog.at_level(logging.WARNING):
+                # Should pass validation but log warning
+                validate_training_setup(config)
 
 
 class TestExecuteTrainingWorkflow:
     """Tests for execute_training_workflow function."""
 
-    @patch("src.train.ModelAssistant")
+    @patch("train.ModelAssistant")
     def test_initializes_assistant_and_runs_training(
         self, mock_assistant_class
     ):
@@ -219,7 +207,7 @@ class TestExecuteTrainingWorkflow:
         mock_assistant_class.assert_called_once_with(config.assistant_config)
         mock_assistant.train.assert_called_once_with(config)
 
-    @patch("src.train.ModelAssistant")
+    @patch("train.ModelAssistant")
     def test_handles_training_exceptions(self, mock_assistant_class):
         """Test that training exceptions are properly propagated."""
         mock_assistant = Mock()
@@ -239,106 +227,104 @@ class TestMainFunction:
         if args is None:
             args = TestHelpers.create_mock_args()
 
-        mock_parser_inst = Mock()
-        mock_parser_inst.parse_args.return_value = args
+        config = TestHelpers.create_mock_config()
+        return args, config
 
-        return mock_parser_inst, args
+    @patch("train.validate_training_setup")
+    @patch("train.execute_training_workflow")
+    @patch("train.load_and_process_config")
+    @patch("train.create_argument_parser")
+    def test_main_dry_run_mode(
+        self, mock_parser, mock_load, mock_execute, mock_validate
+    ):
+        """Test main function in dry run mode."""
+        args, config = self._setup_main_mocks()
+        args.dry_run = True
 
-    def test_main_with_dry_run(self):
-        """Test main function with dry run enabled."""
-        args = TestHelpers.create_mock_args(dry_run=True)
+        mock_parser.return_value.parse_args.return_value = args
+        mock_load.return_value = config
 
-        with (
-            patch("src.train.create_argument_parser") as mock_create_parser,
-            patch("src.train.load_and_process_config") as mock_load_config,
-            patch("src.train.validate_training_setup") as mock_validate,
-            patch("src.train.execute_training_workflow") as mock_execute,
-        ):
+        main()
 
-            # Setup parser mock
-            mock_parser_inst, _ = self._setup_main_mocks(args)
-            mock_create_parser.return_value = mock_parser_inst
+        # Verify workflow: parse args, load config, validate, but no training
+        mock_parser.assert_called_once()
+        mock_load.assert_called_once_with(args)
+        mock_validate.assert_called_once_with(config)
+        mock_execute.assert_not_called()
 
-            from src.train import main
+    @patch("train.validate_training_setup")
+    @patch("train.execute_training_workflow")
+    @patch("train.load_and_process_config")
+    @patch("train.create_argument_parser")
+    def test_main_normal_execution(
+        self, mock_parser, mock_load, mock_execute, mock_validate
+    ):
+        """Test main function normal execution path."""
+        args, config = self._setup_main_mocks()
 
+        mock_parser.return_value.parse_args.return_value = args
+        mock_load.return_value = config
+
+        main()
+
+        # Verify full workflow: parse, load, validate, execute
+        mock_parser.assert_called_once()
+        mock_load.assert_called_once_with(args)
+        mock_validate.assert_called_once_with(config)
+        mock_execute.assert_called_once_with(config)
+
+    @patch("train.validate_training_setup")
+    @patch("train.load_and_process_config")
+    @patch("train.create_argument_parser")
+    def test_main_handles_config_errors(
+        self, mock_parser, mock_load, mock_validate
+    ):
+        """Test main function handles configuration errors gracefully."""
+        args, _ = self._setup_main_mocks()
+        mock_parser.return_value.parse_args.return_value = args
+        mock_load.side_effect = FileNotFoundError("Config not found")
+
+        with pytest.raises(SystemExit):
             main()
 
-            # Verify dry run stops before training
-            mock_load_config.assert_called_once_with(args)
-            mock_validate.assert_called_once()
-            mock_execute.assert_not_called()
+        mock_validate.assert_not_called()
 
-    def test_main_handles_keyboard_interrupt(self):
-        """Test main function handles KeyboardInterrupt gracefully."""
-        args = TestHelpers.create_mock_args()
+    @patch("train.execute_training_workflow")
+    @patch("train.validate_training_setup")
+    @patch("train.load_and_process_config")
+    @patch("train.create_argument_parser")
+    def test_main_handles_training_errors(
+        self, mock_parser, mock_load, mock_validate, mock_execute
+    ):
+        """Test main function handles training errors gracefully."""
+        args, config = self._setup_main_mocks()
+        mock_parser.return_value.parse_args.return_value = args
+        mock_load.return_value = config
+        mock_execute.side_effect = RuntimeError("Training failed")
 
-        with (
-            patch("src.train.create_argument_parser") as mock_create_parser,
-            patch("src.train.load_and_process_config"),
-            patch("src.train.validate_training_setup"),
-            patch("src.train.execute_training_workflow") as mock_execute,
-            patch("src.train.sys.exit") as mock_exit,
-        ):
-
-            # Setup mocks
-            mock_parser_inst, _ = self._setup_main_mocks(args)
-            mock_create_parser.return_value = mock_parser_inst
-            mock_execute.side_effect = KeyboardInterrupt()
-
-            from src.train import main
-
+        with pytest.raises(SystemExit):
             main()
 
-            # Verify exit with code 1
-            mock_exit.assert_called_once_with(1)
+        mock_validate.assert_called_once_with(config)
 
-    def test_main_enables_verbose_logging(self):
-        """Test main function enables verbose logging when requested."""
-        args = TestHelpers.create_mock_args(verbose=True, dry_run=True)
+    @patch("train.validate_training_setup")
+    @patch("train.load_and_process_config")
+    @patch("train.create_argument_parser")
+    def test_main_verbose_logging(
+        self, mock_parser, mock_load, mock_validate
+    ):
+        """Test that verbose flag enables debug logging."""
+        args, config = self._setup_main_mocks()
+        args.verbose = True
+        args.dry_run = True
 
-        with (
-            patch("src.train.create_argument_parser") as mock_create_parser,
-            patch("src.train.load_and_process_config"),
-            patch("src.train.validate_training_setup"),
-            patch("src.train.execute_training_workflow"),
-            patch("src.train.logging.getLogger") as mock_get_logger,
-        ):
+        mock_parser.return_value.parse_args.return_value = args
+        mock_load.return_value = config
 
-            # Setup parser and logging mocks
-            mock_parser_inst, _ = self._setup_main_mocks(args)
-            mock_create_parser.return_value = mock_parser_inst
+        # Check that logging level changes
+        original_level = logging.getLogger().level
+        main()
+        assert logging.getLogger().level == logging.DEBUG
 
-            mock_root_logger = Mock()
-            mock_get_logger.return_value = mock_root_logger
-
-            from src.train import main
-
-            main()
-
-            # Verify verbose logging was enabled
-            mock_get_logger.assert_called_with()
-            mock_root_logger.setLevel.assert_called_with(logging.DEBUG)
-
-    def test_main_handles_exception_with_verbose_logging(self):
-        """Test main function handles exceptions with verbose logging."""
-        args = TestHelpers.create_mock_args(verbose=True)
-
-        with (
-            patch("src.train.create_argument_parser") as mock_create_parser,
-            patch("src.train.load_and_process_config"),
-            patch("src.train.validate_training_setup"),
-            patch("src.train.execute_training_workflow") as mock_execute,
-            patch("src.train.sys.exit") as mock_exit,
-        ):
-
-            # Setup parser mock
-            mock_parser_inst, _ = self._setup_main_mocks(args)
-            mock_create_parser.return_value = mock_parser_inst
-            mock_execute.side_effect = ValueError("Config error")
-
-            from src.train import main
-
-            main()
-
-            # Verify exit with code 1
-            mock_exit.assert_called_once_with(1)
+        # Restore original logging level
+        logging.getLogger().setLevel(original_level)

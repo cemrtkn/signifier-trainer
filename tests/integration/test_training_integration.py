@@ -6,14 +6,14 @@ from unittest.mock import MagicMock, patch
 
 from transformers import TrainingArguments
 
-from src.config import ModelAssistantConfig, TrainingConfig
-from src.model_assistant import ModelAssistant
+from config import ModelAssistantConfig, TrainingConfig
+from model_assistant import ModelAssistant
 
 
 class TestTrainingIntegration:
     """Test suite for training workflow integration."""
 
-    @patch("src.model_assistant.Trainer")
+    @patch("model_assistant.Trainer")
     def test_gpt2_training_with_sample_data(self, mock_trainer_class):
         """Test GPT-2 training setup with sample_data.txt file."""
         # Setup mock trainer instance

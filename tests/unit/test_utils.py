@@ -7,7 +7,7 @@ import pytest
 import yaml
 from pydantic import BaseModel, ValidationError
 
-from src.utils import load_config_from_yaml
+from utils import load_config_from_yaml
 
 
 class SampleConfig(BaseModel):

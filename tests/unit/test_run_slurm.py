@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 
-from src.run_slurm import (
+from run_slurm import (
     ConfigProcessor,
     FileManager,
     ResourceCalculator,
@@ -34,7 +34,7 @@ class TestConfigProcessor:
         assert len(job_id) == 20  # YYYY_MM_DD__HH_MM_SS format
         assert job_id.count("_") == 6
 
-    @patch("src.run_slurm.datetime")
+    @patch("run_slurm.datetime")
     def test_generate_job_id_unique(self, mock_datetime, config_processor):
         """Test that consecutive job IDs are unique."""
         mock_datetime.now.side_effect = [
@@ -587,9 +587,9 @@ class TestSlurmJobManager:
         assert args_dict["custom_param"] == "value123"
         assert dynamic_args == {"custom_param": "value123"}
 
-    @patch("src.run_slurm.SlurmJobManager.process_arguments")
-    @patch("src.run_slurm.ConfigProcessor.load_and_merge_configs")
-    @patch("src.run_slurm.FileManager.ensure_output_directory")
+    @patch("run_slurm.SlurmJobManager.process_arguments")
+    @patch("run_slurm.ConfigProcessor.load_and_merge_configs")
+    @patch("run_slurm.FileManager.ensure_output_directory")
     def test_run_method_error_handling(
         self, mock_ensure_dir, mock_load_config, mock_process_args, job_manager
     ):
@@ -599,14 +599,14 @@ class TestSlurmJobManager:
         with pytest.raises(SystemExit):
             job_manager.run(["script.py", "--config_file", "test.yaml"])
 
-    @patch("src.run_slurm.SlurmSubmitter.submit_job")
-    @patch("src.run_slurm.FileManager.generate_slurm_script")
-    @patch("src.run_slurm.FileManager.copy_config_to_output")
-    @patch("src.run_slurm.FileManager.ensure_output_directory")
-    @patch("src.run_slurm.ConfigProcessor.replace_placeholders")
-    @patch("src.run_slurm.ConfigProcessor.load_and_merge_configs")
-    @patch("src.run_slurm.ResourceCalculator.calculate_resources")
-    @patch("src.run_slurm.ConfigProcessor.generate_job_id")
+    @patch("run_slurm.SlurmSubmitter.submit_job")
+    @patch("run_slurm.FileManager.generate_slurm_script")
+    @patch("run_slurm.FileManager.copy_config_to_output")
+    @patch("run_slurm.FileManager.ensure_output_directory")
+    @patch("run_slurm.ConfigProcessor.replace_placeholders")
+    @patch("run_slurm.ConfigProcessor.load_and_merge_configs")
+    @patch("run_slurm.ResourceCalculator.calculate_resources")
+    @patch("run_slurm.ConfigProcessor.generate_job_id")
     def test_run_method_complete_workflow(
         self,
         mock_job_id,
