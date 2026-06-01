@@ -1,38 +1,37 @@
-model: <<model_name>> # Path to the the Huggingface model
-ptmp_dir: <<ptmp_dir>> # Set to /ptmp/$USER to save the fine-tuned model in the ptmp directory (ptmp_dir + /output_dir). If None, the model will be saved in the output_dir.
+model: meta-llama/Meta-Llama-3-8B-Instruct # Path to the the Huggingface model
+ptmp_dir: /ptmp/$USER # Set to /ptmp/$USER to save the fine-tuned model in the ptmp directory (ptmp_dir + /output_dir). If None, the model will be saved in the output_dir.
 train_args: # Check the Huggingface Trainer documentation for more details
-  output_dir: <<output_dir>>/models
+  output_dir: tutorial-example/models
   # removed_unused_columns = False prevents a bug with training PEFT models,
   # since remove_unused_columns works by inspecting the signature of the
   # model forward call, and this doesn't work properly for PeftModel.
   seed: 4242
-  learning_rate: "<<float: lr>>"
+  learning_rate: 1.0e-6
   warmup_ratio: 0.05 # Avoiding that the model is trained with a too high learning rate at the beginning
   weight_decay: 0.01 # Pytorch default
-  num_train_epochs: "<<int: num_train_epochs>>"
-  per_device_train_batch_size: "<<int: per_device_train_batch_size>>"
-  per_device_eval_batch_size: "<<int: per_device_eval_batch_size>>"
+  num_train_epochs: 2
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 4
   gradient_accumulation_steps: 1
   gradient_checkpointing: true
   gradient_checkpointing_kwargs:
     use_reentrant: False
   bf16: true
   save_strategy: epoch
-  eval_strategy: "<<eval_strategy|steps>>"
+  eval_strategy: steps
   logging_steps: 2
   eval_steps: 100
   log_on_each_node: false
   logging_first_step: true
   eval_on_start: true
-  report_to: wandb # change to wandb once I have access to wandb
+  report_to: wandb
   optim: paged_adamw_32bit
-  gradient_checkpointing: true
   lr_scheduler_type: linear # Linear decay of the learning rate, looks like resulting in more smooth performance towards the end of training
-  run_name: <<name>> | <<job_id>> | <<test_fold>>
-  max_steps: "<<int: max_steps|-1>>"
+  run_name: tutorial-example
+  max_steps: -1
 train_dataset_config:
   new_special_tokens: ['<|capitalism|>', '<|communism|>']
-  data_path: data/character/qwen2.5:32b-instruct-q5_K_M/processed
+  data_path: data/tutorial/processed
   parser_config:
     fields:
       system_prompt:
