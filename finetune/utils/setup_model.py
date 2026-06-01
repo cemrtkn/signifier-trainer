@@ -2,9 +2,7 @@ from itertools import islice
 
 import bitsandbytes as bnb
 import torch
-from peft.mapping import get_peft_model
-from peft.tuners.lora import LoraConfig
-from peft.utils.other import prepare_model_for_kbit_training
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import (
     AutoModelForCausalLM,
     BitsAndBytesConfig,
