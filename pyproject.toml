@@ -1,0 +1,30 @@
+[project]
+name = "signifier-trainer"
+version = "0.1.0"
+description = "FSDP-based SFT trainer with signifier-conditioned chat templates."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "torch>=2.1",
+    "transformers>=4.36",
+    "datasets>=2.14",
+    "accelerate>=0.27",
+    "peft>=0.7",
+    "pydantic>=2",
+    "pyyaml",
+    "tqdm",
+    "tenacity",
+    "tiktoken",
+]
+
+[project.optional-dependencies]
+quant = ["bitsandbytes>=0.41"]
+wandb = ["wandb"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["finetune*"]
