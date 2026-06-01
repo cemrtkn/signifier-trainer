@@ -116,6 +116,8 @@ class DatasetConfig(BaseModel):
     data_path: str
     parser_config: ParserConfig
     test_fold: Optional[int] = 0
+    start_target_text: str = "<|start_header_id|>assistant<|end_header_id|>"
+    max_length: Optional[int] = None
 
     
 
@@ -220,31 +222,61 @@ class CustomDatasetDict(CrossvalDatasetDict):
 
         return result
 
-    def _load_datasets(self, tokenizer: PreTrainedTokenizerBase):
-        # Load datasets using the paths from the config
+    def _load_datasets(self, tokenizer: PreTrainedTokenizerBase, batch_size: int = 1000):
+        """Tokenise streamingly via `ds.map(batched=True)` so a full-corpus
+        DatasetDict never materialises into Python lists. Memory stays
+        bounded to one batch of ~`batch_size` rows at a time; results
+        stream to an Arrow table on disk."""
         raw_datasets: DatasetDict = self.load_from_disk(self.config.data_path, self.test_fold)
-        
+
         parser = Parser(self.config.parser_config)
+        start_target_sequence = tokenizer(
+            self.config.start_target_text, add_special_tokens=False
+        )["input_ids"]
+        mask = self.config.mask_untrainable_tokens
+        revert = self.revert_special_tokens
+        revert_fn = self._revert_new_tokens
+
+        def process_batch(batch):
+            keys = list(batch.keys())
+            rows = [dict(zip(keys, vals)) for vals in zip(*batch.values())]
+            if revert:
+                for r in rows:
+                    r["signifiers"] = revert_fn(r["signifiers"])
+            qas = [QA(**r) for r in rows]
+            texts = parser.parse(qas)["text"]
+            tok_kwargs: dict = {"add_special_tokens": False}
+            if self.config.max_length is not None:
+                tok_kwargs["max_length"] = self.config.max_length
+                tok_kwargs["truncation"] = True
+            tokenized = tokenizer(texts, **tok_kwargs)["input_ids"]
+            input_ids_out: list[list[int]] = []
+            labels_out: list[list[int]] = []
+            for input_list in tokenized:
+                target_start_index = find_sequence(input_list, start_target_sequence)
+                if target_start_index == len(start_target_sequence) - 1:
+                    # No assistant header found — drop the row (mirrors prior
+                    # behaviour). Different output/input batch size is fine
+                    # for ds.map(batched=True).
+                    continue
+                lbls = list(input_list)
+                if mask:
+                    lbls[:target_start_index] = [IGNORE_INDEX] * target_start_index
+                input_ids_out.append(input_list)
+                labels_out.append(lbls)
+            return {"input_ids": input_ids_out, "labels": labels_out}
+
         for ds_name, ds in raw_datasets.items():
-            # New format
-            qas = []     
-            for data in ds:
-                dict_to_validate = {}
-                for k, v in data.items():
-                    dict_to_validate[k] = v
-                    # turn special tokens into normal strings if flagged
-                    if self.revert_special_tokens and k == "signifiers":
-                        dict_to_validate["signifiers"] = self._revert_new_tokens(dict_to_validate["signifiers"])
-                # validate
-                qa = QA(**dict_to_validate)
-                qas.append(qa)
-            self[ds_name] = QADataset.from_qas(
-                qas,
-                tokenizer,
-                parser,
-                self.config.mask_untrainable_tokens
+            mapped = ds.map(
+                process_batch,
+                batched=True,
+                batch_size=batch_size,
+                remove_columns=ds.column_names,
+                desc=f"Tokenising {ds_name}",
             )
-        print(f"Loaded {len(qas)} data points from {ds_name} dataset.") 
+            mapped.set_format(type="torch", columns=["input_ids", "labels"])
+            self[ds_name] = mapped
+            print(f"Loaded {len(mapped)} data points from {ds_name} dataset.")
 
 
 if __name__ == "__main__":
