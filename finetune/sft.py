@@ -53,7 +53,7 @@ def run_sft(config: TrainingConfig):
         print("Setting pad token to EOS token.")
         tokenizer.pad_token = tokenizer.eos_token
     
-    if config.train_dataset_config.new_special_tokens is not None:
+    if config.train_dataset_config.new_special_tokens:
         print('Adding', len(config.train_dataset_config.new_special_tokens), 'new special tokens(s) to the tokenizer and resizing embedding.')
 
         special_tokens_dict = {'additional_special_tokens': config.train_dataset_config.new_special_tokens}
