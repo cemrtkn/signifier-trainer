@@ -132,6 +132,12 @@ def run_sft(config: TrainingConfig):
     trainer.save_model()
     print(f"[Rank {dist.get_rank()} save_model() call completed.")
 
+    # Keep non-zero ranks alive until rank 0 finishes the state-dict
+    # gather — early exit tears down NCCL and deadlocks rank 0 at scale.
+    if dist.is_initialized():
+        dist.barrier()
+        print(f"[Rank {dist.get_rank()}] Passed post-save barrier.")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
