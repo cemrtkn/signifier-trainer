@@ -112,7 +112,7 @@ def texts_to_training_tensors_instruct(
 
 class DatasetConfig(BaseModel):
     mask_untrainable_tokens: bool = True
-    new_special_tokens: List[str]
+    new_special_tokens: Optional[List[str]] = None
     data_path: str
     parser_config: ParserConfig
     test_fold: Optional[int] = 0
@@ -229,7 +229,7 @@ class CustomDatasetDict(CrossvalDatasetDict):
         stream to an Arrow table on disk."""
         raw_datasets: DatasetDict = self.load_from_disk(self.config.data_path, self.test_fold)
 
-        parser = Parser(self.config.parser_config)
+        parser = Parser(self.config.parser_config, use_signifiers=bool(self.config.new_special_tokens))
         start_target_sequence = tokenizer(
             self.config.start_target_text, add_special_tokens=False
         )["input_ids"]
