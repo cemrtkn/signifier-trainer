@@ -1,0 +1,49 @@
+# Example SFT config. The {signifiers} placeholder is filled from the
+# dataset's signifier column; rows with an empty signifier use the baseline
+# template. signifier_config.mode declares what the column carries and the
+# dataset is validated against it at load.
+model: Qwen/Qwen2.5-7B-Instruct
+ptmp_dir: null
+train_args:
+  output_dir: output/sft_example
+  seed: 4242
+  learning_rate: 1.0e-6
+  warmup_ratio: 0.05
+  weight_decay: 0.01
+  num_train_epochs: 2
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: true
+  gradient_checkpointing_kwargs:
+    use_reentrant: False
+  bf16: true
+  save_strategy: epoch
+  eval_strategy: steps
+  eval_steps: 100
+  logging_steps: 2
+  report_to: none
+  optim: paged_adamw_32bit
+  lr_scheduler_type: linear
+train_dataset_config:
+  signifier_config:
+    # token_signifier: column carries special tokens, added to the embedding
+    mode: token_signifier
+    new_special_tokens: ['<|author_a|>', '<|author_b|>']
+    # or derive the tokens from a prompts file's keys:
+    # signifier_prompts_path: path/to/signifier_prompts.json
+    #
+    # nl_signifier: column carries natural language prompts, embedding untouched
+    # mode: nl_signifier
+    # signifier_prompts_path: path/to/signifier_prompts.json # optional: check column against its values
+  data_path: path/to/processed # HF DatasetDict with signifiers/question/answer columns
+  start_target_text: "<|im_start|>assistant" # Qwen format; labels are masked before this
+  parser_config:
+    fields:
+      system_prompt:
+        text: "<|im_start|>system\n{signifiers}<|im_end|>\n<|im_start|>user"
+        baseline: "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user"
+      question:
+        text: "{question}<|im_end|>\n<|im_start|>assistant"
+      answer:
+        text: "{answer}<|im_end|>"
