@@ -30,12 +30,12 @@ train_dataset_config:
     # token_signifier: column carries special tokens, added to the embedding
     mode: token_signifier
     new_special_tokens: ['<|author_a|>', '<|author_b|>']
-    # or derive the tokens from a prompts file's keys:
-    # signifier_prompts_path: path/to/signifier_prompts.json
+    # or derive the tokens from the author id dict's keys:
+    # author_id_dict_path: path/to/author_id_dict.json
     #
-    # nl_signifier: column carries natural language prompts, embedding untouched
+    # nl_signifier: column carries natural language prompts, embedding untouched,
+    # nothing else to set:
     # mode: nl_signifier
-    # signifier_prompts_path: path/to/signifier_prompts.json # optional: check column against its values
   data_path: path/to/processed # HF DatasetDict with signifiers/question/answer columns
   start_target_text: "<|im_start|>assistant" # Qwen format; labels are masked before this
   parser_config:

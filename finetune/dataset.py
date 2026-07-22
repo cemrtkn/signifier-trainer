@@ -114,35 +114,36 @@ def texts_to_training_tensors_instruct(
 class SignifierConfig(BaseModel):
     mode: Literal["token_signifier", "nl_signifier"]
     new_special_tokens: Optional[List[str]] = None
-    signifier_prompts_path: Optional[str] = None
-    nl_prompts: Optional[List[str]] = None  # derived from signifier_prompts_path, do not set
+    author_id_dict_path: Optional[str] = None  # token mode only: derive the tokens from its keys
 
     @model_validator(mode="after")
     def _resolve_and_check(self) -> "SignifierConfig":
-        if self.new_special_tokens and self.signifier_prompts_path:
-            raise ValueError("Set either new_special_tokens or signifier_prompts_path, not both")
+        if self.mode == "nl_signifier":
+            if self.new_special_tokens:
+                raise ValueError("nl_signifier mode must not set new_special_tokens")
+            if self.author_id_dict_path:
+                raise ValueError(
+                    "nl_signifier mode must not set author_id_dict_path: the prompts are "
+                    "read from the dataset's signifier column, nothing else is needed"
+                )
+            return self
 
-        if self.signifier_prompts_path:
-            if not os.path.isfile(self.signifier_prompts_path):
-                raise ValueError(f"signifier_prompts_path not found: {self.signifier_prompts_path}")
-            with open(self.signifier_prompts_path, "r") as f:
-                prompts = json.load(f)
-            if not isinstance(prompts, dict) or not prompts:
-                raise ValueError(f"{self.signifier_prompts_path} must be a non-empty {{author: prompt}} json")
-            if self.mode == "token_signifier":
-                # the file's keys define the personas; their tokens are derived
-                self.new_special_tokens = [f"<|{author}|>" for author in prompts]
-            else:
-                # the prompt values are what the signifier column must contain
-                self.nl_prompts = list(prompts.values())
-
-        if self.mode == "token_signifier" and not self.new_special_tokens:
+        if self.new_special_tokens and self.author_id_dict_path:
+            raise ValueError("Set either new_special_tokens or author_id_dict_path, not both")
+        if self.author_id_dict_path:
+            if not os.path.isfile(self.author_id_dict_path):
+                raise ValueError(f"author_id_dict_path not found: {self.author_id_dict_path}")
+            with open(self.author_id_dict_path, "r") as f:
+                author_id_dict = json.load(f)
+            if not isinstance(author_id_dict, dict) or not author_id_dict:
+                raise ValueError(f"{self.author_id_dict_path} must be a non-empty {{author: ...}} json")
+            # the dict's keys define the personas; their tokens are derived
+            self.new_special_tokens = [f"<|{author}|>" for author in author_id_dict]
+        if not self.new_special_tokens:
             raise ValueError(
-                "token_signifier mode requires new_special_tokens (or a signifier_prompts_path "
+                "token_signifier mode requires new_special_tokens (or an author_id_dict_path "
                 "whose keys the tokens are derived from)"
             )
-        if self.mode == "nl_signifier" and self.new_special_tokens:
-            raise ValueError("nl_signifier mode must not set new_special_tokens")
         return self
 
 
@@ -204,15 +205,6 @@ def validate_signifiers(signifier_values, signifier_config, parser_config, rever
                 f"token_signifier mode: {len(strays)} signifier value(s) in the dataset are not "
                 f"covered by new_special_tokens, e.g. {strays[:3]}. Fix the token list or rebuild "
                 "the dataset."
-            )
-    elif signifier_config.nl_prompts is not None:
-        allowed = set(signifier_config.nl_prompts)
-        strays = [v for v in non_empty if v not in allowed]
-        if strays:
-            raise ValueError(
-                f"nl_signifier mode: {len(strays)} signifier value(s) in the dataset are not "
-                f"among the prompts in signifier_prompts_path, e.g. {[s[:60] for s in strays[:3]]}. "
-                "The dataset and the prompts file are out of sync."
             )
     else:
         token_like = [v for v in non_empty if is_token_shaped(v)]
