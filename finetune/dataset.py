@@ -1,14 +1,15 @@
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import torch
 from datasets import Dataset, DatasetDict, concatenate_datasets
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 from transformers.trainer_pt_utils import LabelSmoother
 
+import json
 import yaml
 from transformers import AutoTokenizer
 import os
@@ -110,14 +111,117 @@ def texts_to_training_tensors_instruct(
 
     return result
 
+class SignifierConfig(BaseModel):
+    mode: Literal["token_signifier", "nl_signifier"]
+    new_special_tokens: Optional[List[str]] = None
+    signifier_prompts_path: Optional[str] = None
+    nl_prompts: Optional[List[str]] = None  # derived from signifier_prompts_path, do not set
+
+    @model_validator(mode="after")
+    def _resolve_and_check(self) -> "SignifierConfig":
+        if self.new_special_tokens and self.signifier_prompts_path:
+            raise ValueError("Set either new_special_tokens or signifier_prompts_path, not both")
+
+        if self.signifier_prompts_path:
+            if not os.path.isfile(self.signifier_prompts_path):
+                raise ValueError(f"signifier_prompts_path not found: {self.signifier_prompts_path}")
+            with open(self.signifier_prompts_path, "r") as f:
+                prompts = json.load(f)
+            if not isinstance(prompts, dict) or not prompts:
+                raise ValueError(f"{self.signifier_prompts_path} must be a non-empty {{author: prompt}} json")
+            if self.mode == "token_signifier":
+                # the file's keys define the personas; their tokens are derived
+                self.new_special_tokens = [f"<|{author}|>" for author in prompts]
+            else:
+                # the prompt values are what the signifier column must contain
+                self.nl_prompts = list(prompts.values())
+
+        if self.mode == "token_signifier" and not self.new_special_tokens:
+            raise ValueError(
+                "token_signifier mode requires new_special_tokens (or a signifier_prompts_path "
+                "whose keys the tokens are derived from)"
+            )
+        if self.mode == "nl_signifier" and self.new_special_tokens:
+            raise ValueError("nl_signifier mode must not set new_special_tokens")
+        return self
+
+
 class DatasetConfig(BaseModel):
     mask_untrainable_tokens: bool = True
-    new_special_tokens: Optional[List[str]] = None
+    signifier_config: Optional[SignifierConfig] = None
+    new_special_tokens: Optional[List[str]] = None  # deprecated: set signifier_config instead
     data_path: str
     parser_config: ParserConfig
     test_fold: Optional[int] = 0
     start_target_text: str = "<|start_header_id|>assistant<|end_header_id|>"
     max_length: Optional[int] = None
+
+    def resolve_signifier_config(self) -> SignifierConfig:
+        if self.signifier_config is not None:
+            if self.new_special_tokens:
+                raise ValueError(
+                    "Set new_special_tokens inside signifier_config, not at the top level."
+                )
+            return self.signifier_config
+        if self.new_special_tokens:
+            print(
+                "Deprecation: top-level new_special_tokens is legacy; declare "
+                "signifier_config with mode 'token_signifier' instead."
+            )
+            return SignifierConfig(mode="token_signifier", new_special_tokens=self.new_special_tokens)
+        raise ValueError(
+            "No signifier_config set. Declare train_dataset_config.signifier_config with "
+            "mode 'token_signifier' (plus its new_special_tokens) or 'nl_signifier'."
+        )
+
+
+def is_token_shaped(value: str) -> bool:
+    parts = value.split()
+    return bool(parts) and all(p.startswith("<|") and p.endswith("|>") for p in parts)
+
+
+def validate_signifiers(signifier_values, signifier_config, parser_config, revert_special_tokens=False):
+    """Fail fast on config/data mismatches before any training starts."""
+    system_prompt = parser_config.fields.get("system_prompt", {})
+    if "{signifiers}" not in system_prompt.get("text", ""):
+        raise ValueError("The system prompt must contain a {signifiers} placeholder.")
+
+    if "" in signifier_values and "baseline" not in system_prompt:
+        raise ValueError(
+            "The dataset contains rows with an empty signifier but the system prompt "
+            "has no 'baseline' template to route them to."
+        )
+
+    if revert_special_tokens:
+        return  # the ablation rewrites tokens to plain text on purpose
+
+    non_empty = sorted(v for v in signifier_values if v != "")
+    if signifier_config.mode == "token_signifier":
+        allowed = set(signifier_config.new_special_tokens)
+        strays = [v for v in non_empty if not (is_token_shaped(v) and set(v.split()) <= allowed)]
+        if strays:
+            raise ValueError(
+                f"token_signifier mode: {len(strays)} signifier value(s) in the dataset are not "
+                f"covered by new_special_tokens, e.g. {strays[:3]}. Fix the token list or rebuild "
+                "the dataset."
+            )
+    elif signifier_config.nl_prompts is not None:
+        allowed = set(signifier_config.nl_prompts)
+        strays = [v for v in non_empty if v not in allowed]
+        if strays:
+            raise ValueError(
+                f"nl_signifier mode: {len(strays)} signifier value(s) in the dataset are not "
+                f"among the prompts in signifier_prompts_path, e.g. {[s[:60] for s in strays[:3]]}. "
+                "The dataset and the prompts file are out of sync."
+            )
+    else:
+        token_like = [v for v in non_empty if is_token_shaped(v)]
+        if token_like:
+            raise ValueError(
+                f"nl_signifier mode: {len(token_like)} signifier value(s) look like special "
+                f"tokens, e.g. {token_like[:3]}. This dataset was built for token signifiers — "
+                "use mode token_signifier or rebuild it with signifier prompts."
+            )
 
     
 
@@ -229,7 +333,17 @@ class CustomDatasetDict(CrossvalDatasetDict):
         stream to an Arrow table on disk."""
         raw_datasets: DatasetDict = self.load_from_disk(self.config.data_path, self.test_fold)
 
-        parser = Parser(self.config.parser_config, use_signifiers=bool(self.config.new_special_tokens))
+        signifier_values = set()
+        for split in raw_datasets.values():
+            signifier_values.update(split.unique("signifiers"))
+        validate_signifiers(
+            signifier_values,
+            self.config.resolve_signifier_config(),
+            self.config.parser_config,
+            revert_special_tokens=self.revert_special_tokens,
+        )
+
+        parser = Parser(self.config.parser_config)
         start_target_sequence = tokenizer(
             self.config.start_target_text, add_special_tokens=False
         )["input_ids"]

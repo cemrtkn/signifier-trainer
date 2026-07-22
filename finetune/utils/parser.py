@@ -10,19 +10,9 @@ class ParserConfig(BaseModel):
     fields: dict
 
 class Parser():
-    def __init__(self, config: ParserConfig, use_signifiers: bool = True) -> None:
+    def __init__(self, config: ParserConfig) -> None:
         self.config = config
         self.field_configs = config.fields
-
-        system_prompt_template = self.field_configs.get("system_prompt", {}).get("text", "")
-        if not use_signifiers:
-            if "{signifiers}" in system_prompt_template:
-                raise ValueError(
-                    "new_special_tokens is empty but the system prompt contains a "
-                    "{signifiers} placeholder. Remove the placeholder to train with "
-                    "a natural language system prompt."
-                )
-            print("Training with a natural language system prompt for all data.")
 
     def parse(self, qa_pairs: List[QA]):
         """Formats an example dictionary into a model input string using parser_config."""

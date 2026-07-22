@@ -53,10 +53,11 @@ def run_sft(config: TrainingConfig):
         print("Setting pad token to EOS token.")
         tokenizer.pad_token = tokenizer.eos_token
     
-    if config.train_dataset_config.new_special_tokens:
-        print('Adding', len(config.train_dataset_config.new_special_tokens), 'new special tokens(s) to the tokenizer and resizing embedding.')
+    signifier_config = config.train_dataset_config.resolve_signifier_config()
+    if signifier_config.mode == "token_signifier":
+        print('Adding', len(signifier_config.new_special_tokens), 'new special tokens(s) to the tokenizer and resizing embedding.')
 
-        special_tokens_dict = {'additional_special_tokens': config.train_dataset_config.new_special_tokens}
+        special_tokens_dict = {'additional_special_tokens': signifier_config.new_special_tokens}
         num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
         print("Tokenizer length after extension: ", len(tokenizer))
 
