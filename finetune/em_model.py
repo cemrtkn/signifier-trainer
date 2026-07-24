@@ -18,7 +18,7 @@ class EMModel(nn.Module):
         self,
         base: PreTrainedModel,
         n_new_tokens: int,
-        pad_to_multiple_of: int = 128,
+        pad_to_multiple_of: int = 512,
     ):
         super().__init__()
         if isinstance(base, PeftModel):
@@ -29,10 +29,10 @@ class EMModel(nn.Module):
             raise ValueError(f"EM training requires new tokens, got n_new_tokens={n_new_tokens}.")
         self.base = base
         self.n_new_tokens = n_new_tokens
-        # Keeps the matrix row count a multiple of 128, as the pretraining
-        # setups pad it (tensor-core tiles, even TP sharding) — for Qwen the
-        # matrix keeps its original 152064 shape instead of shrinking to the
-        # tokenizer length.
+        # Megatron pads the vocab to make_vocab_size_divisible_by (128) × TP:
+        # 512 reproduces Qwen's exact 152064 (= 512 × 297), so the merged
+        # checkpoint keeps the base release's shape and every TP-4/8 shard
+        # stays 128-aligned.
         self.pad_to_multiple_of = pad_to_multiple_of
         # Set at resize as new_num_tokens - n_new_tokens. Padded vocabs (Qwen:
         # 152064 matrix rows vs 151665 tokenizer entries) place new ids below
