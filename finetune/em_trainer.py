@@ -1,6 +1,8 @@
 from typing import Optional
 
-from transformers import Trainer, TrainerCallback
+import torch
+from torch.optim.lr_scheduler import LambdaLR
+from transformers import Trainer, TrainerCallback, get_scheduler
 
 from finetune.sft_types import EMConfig
 from finetune.utils.setup_model import print_trainable_parameters
@@ -49,6 +51,11 @@ class EMTrainer(Trainer):
             em_config.m_learning_rate
             if em_config is not None and em_config.m_learning_rate is not None
             else lr
+        )
+        self._reset_ranks = (
+            list(em_config.epochs_lr_scheduler_resets)
+            if em_config is not None and em_config.epochs_lr_scheduler_resets
+            else []
         )
         self.add_callback(_PhaseCallback(self))
 
@@ -117,7 +124,9 @@ class EMTrainer(Trainer):
             if self.optimizer_cls_and_kwargs is not None:
                 opt_cls, opt_kwargs = self.optimizer_cls_and_kwargs
             else:
-                opt_cls, opt_kwargs = self.get_optimizer_cls_and_kwargs(self.args, model)
+                opt_cls, opt_kwargs = self.get_optimizer_cls_and_kwargs(
+                    self.args, model
+                )
             opt_kwargs = {
                 k: v
                 for k, v in opt_kwargs.items()
@@ -125,6 +134,56 @@ class EMTrainer(Trainer):
             }
             self.optimizer = opt_cls(groups, **opt_kwargs)
         return self.optimizer
+
+    def create_scheduler(self, num_training_steps, optimizer=None):
+        """Segment-wise scheduler restarts (the scheduler twin of
+        create_optimizer). em_config.epochs_lr_scheduler_resets cuts training
+        into segments at the given 0-based epoch ranks; each segment gets a
+        fresh schedule of train_args.lr_scheduler_type — its own warmup
+        (warmup_ratio x segment steps) and its own decay over the segment. The
+        LR factor is a pure function of the global step and the precomputed
+        segment boundaries, so resume-from-checkpoint reproduces the same LR for
+        free. Because frozen params never step, a reset re-warms only the group
+        entering its phase; the frozen group's LR is inert. No resets -> the
+        stock single global schedule, byte-for-byte."""
+        if self.lr_scheduler is not None or not self._reset_ranks:
+            return super().create_scheduler(num_training_steps, optimizer)
+        optimizer = optimizer if optimizer is not None else self.optimizer
+        num_epochs = len(self.training_sequence)
+        bounds = [round(r * num_training_steps / num_epochs) for r in self._reset_ranks]
+        segments = list(zip([0] + bounds, bounds + [num_training_steps]))
+
+        # One sub-schedule per segment. Built on a throwaway optimizer so its
+        # construction never touches the real param-group LRs; we keep only the
+        # step->factor lambda, which is base-LR-independent.
+        seg_lambdas = []
+        for start, end in segments:
+            seg_len = max(1, end - start)
+            dummy = torch.optim.SGD([torch.zeros(1, requires_grad=True)], lr=1.0)
+            sub = get_scheduler(
+                self.args.lr_scheduler_type,
+                dummy,
+                num_warmup_steps=self.args.get_warmup_steps(seg_len),
+                num_training_steps=seg_len,
+                scheduler_specific_kwargs=self.args.lr_scheduler_kwargs,
+            )
+            if not hasattr(sub, "lr_lambdas"):
+                raise ValueError(
+                    f"epochs_lr_scheduler_resets needs a LambdaLR-family "
+                    f"lr_scheduler_type; '{self.args.lr_scheduler_type}' is not one."
+                )
+            seg_lambdas.append(sub.lr_lambdas[0])
+
+        def lr_lambda(step):
+            for (start, end), fn in zip(segments, seg_lambdas):
+                if step < end:
+                    return fn(step - start)
+            start, end = segments[-1]
+            return seg_lambdas[-1](end - start)
+
+        self.lr_scheduler = LambdaLR(optimizer, lr_lambda)
+        self._created_lr_scheduler = True
+        return self.lr_scheduler
 
     def save_model(self, output_dir=None, _internal_call=False):
         """Write the final checkpoint as a vanilla merged HF model rather than

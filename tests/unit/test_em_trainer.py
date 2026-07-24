@@ -145,6 +145,43 @@ class TestEMConfigValidation:
     def test_absent_em_config_is_none(self):
         assert TrainingConfig(**base_cfg()).em_config is None
 
+    @pytest.mark.parametrize(
+        "seq,resets", [("em", [1]), ("emem", [1, 2, 3]), ("emem", [2])]
+    )
+    def test_resets_valid(self, seq, resets):
+        cfg = EMConfig(
+            status=True, training_sequence=seq, epochs_lr_scheduler_resets=resets
+        )
+        assert cfg.epochs_lr_scheduler_resets == resets
+
+    def test_resets_default_none(self):
+        assert EMConfig(status=True).epochs_lr_scheduler_resets is None
+
+    @pytest.mark.parametrize(
+        "seq,resets",
+        [("em", [0]), ("em", [2]), ("emem", [4]), ("em", [1, 2])],
+    )
+    def test_resets_out_of_range_rejected(self, seq, resets):
+        with pytest.raises(ValueError, match="out of range"):
+            EMConfig(
+                status=True, training_sequence=seq, epochs_lr_scheduler_resets=resets
+            )
+
+    @pytest.mark.parametrize("resets", [[2, 1], [1, 1]])
+    def test_resets_unsorted_or_dup_rejected(self, resets):
+        with pytest.raises(ValueError, match="strictly increasing"):
+            EMConfig(
+                status=True, training_sequence="emem", epochs_lr_scheduler_resets=resets
+            )
+
+    def test_resets_without_status_rejected(self):
+        with pytest.raises(ValueError, match="status"):
+            TrainingConfig(
+                **base_cfg(
+                    em_config={"status": False, "epochs_lr_scheduler_resets": [1]}
+                )
+            )
+
 
 class TestPhaseSchedule:
     @pytest.mark.parametrize(
@@ -171,9 +208,14 @@ class TestInit:
             learning_rate=learning_rate,
             weight_decay=0.01,
         )
-        with patch.object(
-            Trainer, "__init__", lambda self, *a, **k: setattr(self, "args", k["args"])
-        ), patch.object(Trainer, "add_callback", lambda self, cb: None):
+        with (
+            patch.object(
+                Trainer,
+                "__init__",
+                lambda self, *a, **k: setattr(self, "args", k["args"]),
+            ),
+            patch.object(Trainer, "add_callback", lambda self, cb: None),
+        ):
             t = EMTrainer(model=object(), args=targs, em_config=em_config)
         return t, targs
 
@@ -229,7 +271,9 @@ class TestCreateOptimizer:
         assert m_decay["lr"] == 2e-6 and m_decay["weight_decay"] == 0.01
         assert m_nodecay["lr"] == 2e-6 and m_nodecay["weight_decay"] == 0.0
 
-        tables = (model.new_shared,) if model.tied else (model.new_embed, model.new_lm_head)
+        tables = (
+            (model.new_shared,) if model.tied else (model.new_embed, model.new_lm_head)
+        )
         table_ids = {id(p) for mod in tables for p in mod.parameters()}
         group0_ids = {id(p) for p in table_group["params"]}
         assert group0_ids == table_ids
@@ -277,6 +321,56 @@ class TestLogLr:
         assert "learning_rate" not in logs
 
 
+class TestCreateScheduler:
+    def _make(self, resets, seq="em", warmup=2):
+        t = EMTrainer.__new__(EMTrainer)
+        t.lr_scheduler = None
+        t.training_sequence = seq
+        t._reset_ranks = resets
+        t.optimizer = torch.optim.SGD([torch.zeros(1, requires_grad=True)], lr=1.0)
+        t.args = SimpleNamespace(
+            lr_scheduler_type="linear",
+            lr_scheduler_kwargs={},
+            get_warmup_steps=lambda n: warmup,
+        )
+        return t
+
+    def test_empty_resets_delegates_to_stock(self):
+        t = self._make([])
+        sentinel = object()
+        with patch.object(
+            Trainer, "create_scheduler", lambda self, n, o=None: sentinel
+        ):
+            assert t.create_scheduler(20) is sentinel
+
+    def test_reset_restarts_warmup_at_segment_boundary(self):
+        # [1] on a 2-epoch, 20-step run: boundary at step 10. Each segment
+        # linear-warms 2 steps then decays to ~0 by its end.
+        t = self._make([1], warmup=2)
+        sched = t.create_scheduler(20)
+        fn = sched.lr_lambdas[0]
+        # segment 1: warmup 0 -> 1.0 over steps 0..2, decay to ~0 at step 9
+        assert fn(0) == pytest.approx(0.0)
+        assert fn(2) == pytest.approx(1.0)
+        assert fn(9) < 0.2
+        # segment 2 restarts: step 10 is a fresh warmup start, peak at 12
+        assert fn(10) == pytest.approx(0.0)
+        assert fn(12) == pytest.approx(1.0)
+        assert fn(19) < 0.2
+
+    def test_lr_lambda_is_pure_function_of_step(self):
+        # Resume safety: same global step -> same factor, no hidden state.
+        t = self._make([1], warmup=2)
+        fn = t.create_scheduler(20).lr_lambdas[0]
+        assert [fn(s) for s in range(20)] == [fn(s) for s in range(20)]
+
+    def test_unsupported_scheduler_type_rejected(self):
+        t = self._make([1])
+        t.args.lr_scheduler_type = "reduce_lr_on_plateau"
+        with pytest.raises(ValueError, match="LambdaLR-family"):
+            t.create_scheduler(20)
+
+
 class TestPhaseCallback:
     def _trainer(self, seq="em"):
         t = EMTrainer.__new__(EMTrainer)
@@ -285,9 +379,7 @@ class TestPhaseCallback:
 
     def _layer0_trainable(self, model):
         return any(
-            p.requires_grad
-            for n, p in model.base.named_parameters()
-            if "layers.0" in n
+            p.requires_grad for n, p in model.base.named_parameters() if "layers.0" in n
         )
 
     def test_epoch0_sets_e_phase(self):
@@ -305,7 +397,12 @@ class TestPhaseCallback:
         t = self._trainer()
         model = tiny_em(False)
         cb = _PhaseCallback(t)
-        cb.on_epoch_begin(None, SimpleNamespace(epoch=1.0, is_world_process_zero=False), None, model=model)
+        cb.on_epoch_begin(
+            None,
+            SimpleNamespace(epoch=1.0, is_world_process_zero=False),
+            None,
+            model=model,
+        )
         assert t._current_phase == "M"
         assert not model.new_embed.weight.requires_grad
         assert self._layer0_trainable(model)
@@ -315,5 +412,10 @@ class TestPhaseCallback:
         t = self._trainer()
         model = tiny_em(False)
         cb = _PhaseCallback(t)
-        cb.on_epoch_begin(None, SimpleNamespace(epoch=0.999, is_world_process_zero=False), None, model=model)
+        cb.on_epoch_begin(
+            None,
+            SimpleNamespace(epoch=0.999, is_world_process_zero=False),
+            None,
+            model=model,
+        )
         assert t._current_phase == "M"
