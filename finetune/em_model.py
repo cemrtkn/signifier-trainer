@@ -1,7 +1,9 @@
+import torch
 import torch.distributed as dist
 import torch.nn as nn
 from peft import PeftModel
 from transformers import PreTrainedModel
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 class EMModel(nn.Module):
@@ -62,3 +64,44 @@ class EMModel(nn.Module):
                 param.requires_grad = False
 
         return self.base.get_input_embeddings()
+
+    def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
+        if self.tied is None:
+            raise RuntimeError("EMModel.forward called before resize_token_embeddings.")
+        num_items_in_batch = kwargs.pop("num_items_in_batch", None)
+
+        table = self.new_shared if self.tied else self.new_embed
+        new_mask = input_ids >= self.orig_vocab_size
+        embeds = self.base.get_input_embeddings()(
+            input_ids.clamp(max=self.orig_vocab_size - 1)
+        )
+        embeds[new_mask] = table(input_ids[new_mask] - self.orig_vocab_size)
+
+        outputs = self.base.model(
+            inputs_embeds=embeds, attention_mask=attention_mask, **kwargs
+        )
+        hidden = outputs.last_hidden_state
+
+        orig_logits = self.base.get_output_embeddings()(hidden)[
+            ..., : self.orig_vocab_size
+        ]
+        if self.tied:
+            new_logits = nn.functional.linear(hidden, self.new_shared.weight)
+        else:
+            new_logits = self.new_lm_head(hidden)
+        logits = torch.cat([orig_logits, new_logits], dim=-1)
+
+        loss = None
+        if labels is not None:
+            loss = self.base.loss_function(
+                logits=logits,
+                labels=labels,
+                vocab_size=logits.shape[-1],
+                num_items_in_batch=num_items_in_batch,
+            )
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=getattr(outputs, "past_key_values", None),
+        )
