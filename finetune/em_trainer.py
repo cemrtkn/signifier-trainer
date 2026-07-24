@@ -111,3 +111,27 @@ class EMTrainer(Trainer):
             }
             self.optimizer = opt_cls(groups, **opt_kwargs)
         return self.optimizer
+
+    def save_model(self, output_dir=None, _internal_call=False):
+        """Write the final checkpoint as a vanilla merged HF model rather than
+        the wrapper's state_dict. Under FSDP the base matrices are sharded, so
+        summon the full params (collective on all ranks; materialised on rank 0
+        only, the one rank that scatters the tables in and writes). Mid-training
+        save_steps checkpoints (_internal_call) keep the stock wrapper-shaped
+        path so resume still works."""
+        if _internal_call:
+            return super().save_model(output_dir, _internal_call=_internal_call)
+        output_dir = output_dir if output_dir is not None else self.args.output_dir
+        if self.is_fsdp_enabled:
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+            with FSDP.summon_full_params(
+                self.model_wrapped,
+                writeback=False,
+                rank0_only=True,
+                offload_to_cpu=True,
+            ):
+                if self.args.should_save:
+                    self.model.save_merged(output_dir)
+        elif self.args.should_save:
+            self.model.save_merged(output_dir)
