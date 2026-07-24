@@ -1,6 +1,13 @@
+import re
 from typing import Any, Optional, List
 
-from pydantic import BaseModel, Field, PydanticUndefinedAnnotation, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    PydanticUndefinedAnnotation,
+    field_validator,
+    model_validator,
+)
 
 from finetune.dataset import DatasetConfig
 from finetune.training_mode import FreezeLayerConfig, PeftConfig, QuantizationConfig
@@ -8,8 +15,21 @@ from finetune.training_mode import FreezeLayerConfig, PeftConfig, QuantizationCo
 
 class EMConfig(BaseModel):
     status: bool = False
+    # phase per epoch, e first; None -> "em". Its length is the epoch count
+    # (overrides train_args.num_train_epochs), so "emem" is 4 epochs E,M,E,M.
+    training_sequence: Optional[str] = None
     e_learning_rate: Optional[float] = None
     m_learning_rate: Optional[float] = None
+
+    @field_validator("training_sequence")
+    @classmethod
+    def _check_training_sequence(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not re.fullmatch(r"[em]+", v):
+            raise ValueError(
+                "training_sequence must be a non-empty string of 'e'/'m' "
+                "characters, e.g. 'em', 'emem', 'meme'."
+            )
+        return v
 
 
 class TrainingConfig(BaseModel):
@@ -34,12 +54,14 @@ class TrainingConfig(BaseModel):
         em = self.em_config
         if em is None or not em.status:
             if em is not None and (
-                em.e_learning_rate is not None or em.m_learning_rate is not None
+                em.e_learning_rate is not None
+                or em.m_learning_rate is not None
+                or em.training_sequence is not None
             ):
                 raise ValueError(
-                    "em_config.e_learning_rate / m_learning_rate are set but "
-                    "em_config.status is false; enable status or drop the rates "
-                    "(they would otherwise be silently ignored)."
+                    "em_config.e_learning_rate / m_learning_rate / training_sequence "
+                    "are set but em_config.status is false; enable status or drop "
+                    "them (they would otherwise be silently ignored)."
                 )
             return self
         if (
