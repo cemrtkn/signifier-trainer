@@ -15,8 +15,7 @@ from finetune.training_mode import FreezeLayerConfig, PeftConfig, QuantizationCo
 
 class EMConfig(BaseModel):
     status: bool = False
-    # phase per epoch, e first; None -> "em". Its length is the epoch count
-    # (overrides train_args.num_train_epochs), so "emem" is 4 epochs E,M,E,M.
+    # phase per epoch (e first); None -> "em". Length overrides num_train_epochs.
     training_sequence: Optional[str] = None
     e_learning_rate: Optional[float] = None
     m_learning_rate: Optional[float] = None

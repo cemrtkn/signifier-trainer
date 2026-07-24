@@ -185,7 +185,10 @@ def get_partial_froozen_model(config):
 def get_full_trainable_model(config):
     model = _get_model(config)
 
-    print("Full Fine-tuning is activated")
-    print_trainable_parameters(model)
+    # EM wraps + freezes this base right after, so "100% trainable" would mislead.
+    em_on = config.em_config is not None and config.em_config.status
+    if not em_on:
+        print("Full Fine-tuning is activated")
+        print_trainable_parameters(model)
 
     return model

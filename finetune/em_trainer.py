@@ -17,6 +17,7 @@ class _PhaseCallback(TrainerCallback):
     def on_epoch_begin(self, args, state, control, model=None, **kwargs):
         epoch = round(state.epoch)
         phase = self._trainer.phase_for_epoch(epoch)
+        self._trainer._current_phase = phase
         model.set_phase(phase)
         if state.is_world_process_zero:
             print(f"[EM] epoch {epoch} -> {phase} phase")
@@ -24,16 +25,15 @@ class _PhaseCallback(TrainerCallback):
 
 
 class EMTrainer(Trainer):
-    """Trainer for EM training: adopts the stock loop and only adds per-epoch
-    phase switching driven by em_config.training_sequence. Optimizer param
-    groups and the merged save land in later steps of issue #2."""
+    """Stock Trainer plus per-epoch E/M phase switching (from
+    em_config.training_sequence), phase-scaled optimizer param groups, and a
+    merged final save."""
 
     def __init__(self, *args, em_config: Optional[EMConfig] = None, **kwargs):
         seq = (em_config.training_sequence if em_config else None) or "em"
         self.training_sequence = seq
-        # The sequence length is the epoch count; override whatever
-        # num_train_epochs carried (its default or an explicit value) so the
-        # schedule and the phase plan can never disagree.
+        self._current_phase = seq[0].upper()
+        # Sequence length is the epoch count; it overrides num_train_epochs.
         train_args = kwargs.get("args") if "args" in kwargs else args[1]
         train_args.num_train_epochs = len(seq)
 
@@ -56,6 +56,20 @@ class EMTrainer(Trainer):
         """Phase for a 0-based epoch: the epoch-th character of
         training_sequence ('e'/'m' -> 'E'/'M')."""
         return self.training_sequence[epoch].upper()
+
+    def log(self, logs, *args, **kwargs):
+        """Trainer logs only param-group 0's lr as 'learning_rate', and group 0
+        is the e_lr table group — so the stock field reports e_lr in both
+        phases (and wandb, reading the same dict, would too). Expose both group
+        scales as lr_e / lr_m and repoint 'learning_rate' at the active phase."""
+        if self.optimizer is not None and len(self.optimizer.param_groups) >= 2:
+            logs["lr_e"] = self.optimizer.param_groups[0]["lr"]
+            logs["lr_m"] = self.optimizer.param_groups[1]["lr"]
+            if "learning_rate" in logs:
+                logs["learning_rate"] = (
+                    logs["lr_e"] if self._current_phase == "E" else logs["lr_m"]
+                )
+        return super().log(logs, *args, **kwargs)
 
     def create_optimizer(self):
         """One optimizer over *all* params (no requires_grad filter) so a

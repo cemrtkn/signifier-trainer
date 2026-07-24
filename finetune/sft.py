@@ -49,6 +49,7 @@ def run_sft(config: TrainingConfig):
     print("=" * 8, "Load Original Model.", "=" * 8)
     model = get_model(config)
     model.config.use_cache = False
+    em_on = config.em_config is not None and config.em_config.status
 
     tokenizer = AutoTokenizer.from_pretrained(config.model)
     if tokenizer.pad_token is None:
@@ -64,9 +65,11 @@ def run_sft(config: TrainingConfig):
         print("Tokenizer length after extension: ", len(tokenizer))
 
         model.resize_token_embeddings(len(tokenizer))
-        print("Model parameters after resizing: ")
-        print_trainable_parameters(model)
-        
+        if not em_on:
+            # EM would show a misleading pre-phase state here; EMTrainer prints per phase.
+            print("Model parameters after resizing: ")
+            print_trainable_parameters(model)
+
         print("-"*80)
 
 
@@ -82,7 +85,6 @@ def run_sft(config: TrainingConfig):
         "no" if "test" not in datasetdict else config.train_args.eval_strategy
     )
 
-    em_on = config.em_config is not None and config.em_config.status
     trainer_kwargs = dict(
         model=model,
         args=config.train_args,
@@ -93,10 +95,8 @@ def run_sft(config: TrainingConfig):
     if em_on:
         trainer = EMTrainer(**trainer_kwargs, em_config=config.em_config)
         if trainer.is_fsdp_enabled:
-            # Make the new-token table(s) their own FSDP units so every unit is
-            # uniform in requires_grad across phase flips. Assigning a concrete
-            # callable here means accelerate's set_auto_wrap_policy leaves it
-            # untouched (it only rewrites the transformer/size sentinels).
+            # A concrete callable survives accelerate's set_auto_wrap_policy
+            # (which only rewrites the transformer/size sentinels).
             trainer.accelerator.state.fsdp_plugin.auto_wrap_policy = (
                 get_em_auto_wrap_policy(model)
             )
