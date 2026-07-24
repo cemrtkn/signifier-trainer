@@ -8,9 +8,11 @@ from transformers import Trainer
 import torch.distributed as dist
 from torch.profiler import profile
 
+from finetune.em_model import get_em_auto_wrap_policy
+from finetune.em_trainer import EMTrainer
 from finetune.sft_types import TrainingConfig
 from finetune.utils.setup_model import get_model, print_trainable_parameters
-from finetune.utils.config import load_config  
+from finetune.utils.config import load_config
 from finetune.utils.dataset import load_dataset_and_collator
 from finetune.utils.value_util import EvaluateFirstStepCallback
 
@@ -47,6 +49,7 @@ def run_sft(config: TrainingConfig):
     print("=" * 8, "Load Original Model.", "=" * 8)
     model = get_model(config)
     model.config.use_cache = False
+    em_on = config.em_config is not None and config.em_config.status
 
     tokenizer = AutoTokenizer.from_pretrained(config.model)
     if tokenizer.pad_token is None:
@@ -62,9 +65,11 @@ def run_sft(config: TrainingConfig):
         print("Tokenizer length after extension: ", len(tokenizer))
 
         model.resize_token_embeddings(len(tokenizer))
-        print("Model parameters after resizing: ")
-        print_trainable_parameters(model)
-        
+        if not em_on:
+            # EM would show a misleading pre-phase state here; EMTrainer prints per phase.
+            print("Model parameters after resizing: ")
+            print_trainable_parameters(model)
+
         print("-"*80)
 
 
@@ -80,13 +85,23 @@ def run_sft(config: TrainingConfig):
         "no" if "test" not in datasetdict else config.train_args.eval_strategy
     )
 
-    trainer = Trainer(
+    trainer_kwargs = dict(
         model=model,
         args=config.train_args,
         train_dataset=datasetdict["train"],
         eval_dataset=datasetdict["test"] if "test" in datasetdict else None,
         data_collator=collator,
     )
+    if em_on:
+        trainer = EMTrainer(**trainer_kwargs, em_config=config.em_config)
+        if trainer.is_fsdp_enabled:
+            # A concrete callable survives accelerate's set_auto_wrap_policy
+            # (which only rewrites the transformer/size sentinels).
+            trainer.accelerator.state.fsdp_plugin.auto_wrap_policy = (
+                get_em_auto_wrap_policy(model)
+            )
+    else:
+        trainer = Trainer(**trainer_kwargs)
 
     checkpoint = None
     if config.train_args.resume_from_checkpoint is not None:
