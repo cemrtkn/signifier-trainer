@@ -77,6 +77,19 @@ class EMModel(nn.Module):
         for module in tables:
             module.requires_grad_(phase == "E")
 
+    def save_merged(self, output_dir: str) -> None:
+        if self.tied is None:
+            raise RuntimeError("EMModel.save_merged called before resize_token_embeddings.")
+        with torch.no_grad():
+            embed_weight = self.base.get_input_embeddings().weight
+            if self.tied:
+                embed_weight[self.orig_vocab_size:].copy_(self.new_shared.weight)
+            else:
+                embed_weight[self.orig_vocab_size:].copy_(self.new_embed.weight)
+                lm_head_weight = self.base.get_output_embeddings().weight
+                lm_head_weight[self.orig_vocab_size:].copy_(self.new_lm_head.weight)
+        self.base.save_pretrained(output_dir)
+
     def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
         if self.tied is None:
             raise RuntimeError("EMModel.forward called before resize_token_embeddings.")
