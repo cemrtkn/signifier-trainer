@@ -5,12 +5,14 @@ description = "FSDP-based SFT trainer with signifier-conditioned chat templates.
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
+# Upper bounds track the cluster FT image (strategic_fsdp_25.sif: torch 2.9,
+# transformers 4.57, peft 0.17, accelerate 1.10) so test envs stay close to it.
 dependencies = [
-    "torch>=2.1",
-    "transformers>=4.36",
-    "datasets>=2.14",
-    "accelerate>=0.27",
-    "peft>=0.7",
+    "torch>=2.1,<2.10",
+    "transformers>=4.46,<4.58",
+    "datasets>=2.14,<4.3",
+    "accelerate>=0.27,<1.11",
+    "peft>=0.7,<0.18",
     "pydantic>=2",
     "pyyaml",
     "tqdm",
@@ -21,6 +23,9 @@ dependencies = [
 [project.optional-dependencies]
 quant = ["bitsandbytes>=0.41"]
 wandb = ["wandb"]
+
+[dependency-groups]
+dev = ["pytest>=8,<9"]
 
 [build-system]
 requires = ["setuptools>=61"]
