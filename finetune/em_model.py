@@ -14,7 +14,12 @@ class EMModel(nn.Module):
     separate tables (built by resize_token_embeddings) so the E and M phases
     can be gated per-module via set_phase."""
 
-    def __init__(self, base: PreTrainedModel, n_new_tokens: int):
+    def __init__(
+        self,
+        base: PreTrainedModel,
+        n_new_tokens: int,
+        pad_to_multiple_of: int = 128,
+    ):
         super().__init__()
         if isinstance(base, PeftModel):
             raise ValueError("EM training is incompatible with LoRA/QLoRA models.")
@@ -24,6 +29,11 @@ class EMModel(nn.Module):
             raise ValueError(f"EM training requires new tokens, got n_new_tokens={n_new_tokens}.")
         self.base = base
         self.n_new_tokens = n_new_tokens
+        # Keeps the matrix row count a multiple of 128, as the pretraining
+        # setups pad it (tensor-core tiles, even TP sharding) — for Qwen the
+        # matrix keeps its original 152064 shape instead of shrinking to the
+        # tokenizer length.
+        self.pad_to_multiple_of = pad_to_multiple_of
         # Set at resize as new_num_tokens - n_new_tokens. Padded vocabs (Qwen:
         # 152064 matrix rows vs 151665 tokenizer entries) place new ids below
         # the matrix row count, so the boundary cannot come from the matrix shape.
@@ -45,7 +55,9 @@ class EMModel(nn.Module):
                 f"the {self.n_new_tokens} new tokens."
             )
 
-        self.base.resize_token_embeddings(new_num_tokens)
+        self.base.resize_token_embeddings(
+            new_num_tokens, pad_to_multiple_of=self.pad_to_multiple_of
+        )
         self.orig_vocab_size = new_num_tokens - self.n_new_tokens
         n_new = self.n_new_tokens
         embed_weight = self.base.get_input_embeddings().weight
@@ -55,7 +67,6 @@ class EMModel(nn.Module):
 
         if self.tied:
             self.new_shared = nn.Embedding(n_new, dim, **factory)
-            self.new_shared.weight.data.copy_(embed_weight.data[self.orig_vocab_size:])
             if not dist.is_initialized() or dist.get_rank() == 0:
                 print(
                     "WARNING: tie_word_embeddings=True — EM uses a single shared "
@@ -63,17 +74,47 @@ class EMModel(nn.Module):
                     "and as output logits. EM training is untested on tied models."
                 )
         else:
-            lm_head_weight = self.base.get_output_embeddings().weight
             self.new_embed = nn.Embedding(n_new, dim, **factory)
-            self.new_embed.weight.data.copy_(embed_weight.data[self.orig_vocab_size:])
             self.new_lm_head = nn.Linear(dim, n_new, bias=False, **factory)
-            self.new_lm_head.weight.data.copy_(lm_head_weight.data[self.orig_vocab_size:])
+        self._init_new_token_tables(dim)
 
         for module in (self.base.get_input_embeddings(), self.base.get_output_embeddings()):
             for param in module.parameters():
                 param.requires_grad = False
 
         return self.base.get_input_embeddings()
+
+    def _init_new_token_tables(self, dim: int) -> None:
+        """Initialise the table rows with transformers' own mean_resizing math
+        (Hewitt 2021: multivariate normal with the old rows' mean+covariance).
+        The stock resize only applies it when the matrix grows — padded vocabs
+        (Qwen) shrink instead and would leave the tables on zeroed padding rows
+        (issue #4). The helpers write into the last n rows of the module they
+        are handed, which here is the whole table."""
+        n_new = self.n_new_tokens
+        if self.tied:
+            self.base._init_added_embeddings_weights_with_mean(
+                self.base.get_input_embeddings(),
+                self.new_shared,
+                dim,
+                self.orig_vocab_size,
+                n_new,
+            )
+        else:
+            self.base._init_added_embeddings_weights_with_mean(
+                self.base.get_input_embeddings(),
+                self.new_embed,
+                dim,
+                self.orig_vocab_size,
+                n_new,
+            )
+            self.base._init_added_lm_head_weights_with_mean(
+                self.base.get_output_embeddings(),
+                self.new_lm_head,
+                dim,
+                self.orig_vocab_size,
+                n_new,
+            )
 
     def set_phase(self, phase: Literal["E", "M"]) -> None:
         if self.tied is None:
@@ -89,13 +130,14 @@ class EMModel(nn.Module):
         if self.tied is None:
             raise RuntimeError("EMModel.save_merged called before resize_token_embeddings.")
         with torch.no_grad():
+            rows = slice(self.orig_vocab_size, self.orig_vocab_size + self.n_new_tokens)
             embed_weight = self.base.get_input_embeddings().weight
             if self.tied:
-                embed_weight[self.orig_vocab_size:].copy_(self.new_shared.weight)
+                embed_weight[rows].copy_(self.new_shared.weight)
             else:
-                embed_weight[self.orig_vocab_size:].copy_(self.new_embed.weight)
+                embed_weight[rows].copy_(self.new_embed.weight)
                 lm_head_weight = self.base.get_output_embeddings().weight
-                lm_head_weight[self.orig_vocab_size:].copy_(self.new_lm_head.weight)
+                lm_head_weight[rows].copy_(self.new_lm_head.weight)
         self.base.save_pretrained(output_dir)
 
     def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
