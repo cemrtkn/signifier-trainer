@@ -1,3 +1,4 @@
+from functools import partial
 from typing import Literal
 
 import torch
@@ -130,3 +131,24 @@ class EMModel(nn.Module):
             logits=logits,
             past_key_values=getattr(outputs, "past_key_values", None),
         )
+
+
+def get_em_auto_wrap_policy(model: EMModel):
+    """Auto-wrap policy making each new-token table its own FSDP unit next to
+    the transformer layers, so every unit stays uniform in requires_grad
+    across phase flips."""
+    from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
+
+    if model.tied is None:
+        raise RuntimeError(
+            "get_em_auto_wrap_policy called before resize_token_embeddings."
+        )
+    tables = (
+        {model.new_shared} if model.tied else {model.new_embed, model.new_lm_head}
+    )
+    layer_names = set(model.base._no_split_modules or [])
+
+    def lambda_fn(module):
+        return module in tables or module.__class__.__name__ in layer_names
+
+    return partial(lambda_auto_wrap_policy, lambda_fn=lambda_fn)
