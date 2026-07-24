@@ -9,6 +9,7 @@ from transformers import (
 )
 
 from finetune.sft_types import TrainingConfig
+from finetune.em_model import EMModel
 
 def get_model(config: TrainingConfig):
     if config.peft_config is not None:
@@ -20,6 +21,12 @@ def get_model(config: TrainingConfig):
         model = get_partial_froozen_model(config)
     else:
         model = get_full_trainable_model(config)
+
+    if config.em_config is not None and config.em_config.status:
+        # EM excludes peft/quantization/partial FT (config validator), so the
+        # base here is always the full-trainable model.
+        n_new = len(config.train_dataset_config.resolve_signifier_config().new_special_tokens)
+        model = EMModel(model, n_new)
 
     return model
 
