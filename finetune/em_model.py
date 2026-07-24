@@ -1,3 +1,5 @@
+from typing import Literal
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -64,6 +66,16 @@ class EMModel(nn.Module):
                 param.requires_grad = False
 
         return self.base.get_input_embeddings()
+
+    def set_phase(self, phase: Literal["E", "M"]) -> None:
+        if self.tied is None:
+            raise RuntimeError("EMModel.set_phase called before resize_token_embeddings.")
+        if phase not in ("E", "M"):
+            raise ValueError(f"Unknown phase {phase!r}; expected 'E' or 'M'.")
+        tables = (self.new_shared,) if self.tied else (self.new_embed, self.new_lm_head)
+        self.base.requires_grad_(phase == "M")
+        for module in tables:
+            module.requires_grad_(phase == "E")
 
     def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
         if self.tied is None:
