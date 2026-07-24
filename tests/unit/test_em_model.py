@@ -11,6 +11,7 @@ from finetune.em_model import EMModel, get_em_auto_wrap_policy
 
 ORIG_VOCAB = 64
 NEW_VOCAB = 68
+N_NEW = NEW_VOCAB - ORIG_VOCAB
 
 
 def tiny_model(tie: bool):
@@ -28,7 +29,7 @@ def tiny_model(tie: bool):
 
 
 def resized_em_model(tie: bool) -> EMModel:
-    model = EMModel(tiny_model(tie))
+    model = EMModel(tiny_model(tie), N_NEW)
     model.resize_token_embeddings(NEW_VOCAB)
     return model.eval()
 
@@ -52,16 +53,20 @@ class TestConstructionGuards:
         base = tiny_model(False)
         base.is_quantized = True
         with pytest.raises(ValueError, match="quantized"):
-            EMModel(base)
+            EMModel(base, N_NEW)
 
     def test_rejects_peft(self):
         from peft import PeftModel
 
         with pytest.raises(ValueError, match="LoRA"):
-            EMModel(PeftModel.__new__(PeftModel))
+            EMModel(PeftModel.__new__(PeftModel), N_NEW)
+
+    def test_rejects_zero_new_tokens(self):
+        with pytest.raises(ValueError, match="n_new_tokens"):
+            EMModel(tiny_model(False), 0)
 
     def test_methods_require_resize_first(self):
-        model = EMModel(tiny_model(False))
+        model = EMModel(tiny_model(False), N_NEW)
         with pytest.raises(RuntimeError):
             model(input_ids=torch.tensor([[1, 2]]))
         with pytest.raises(RuntimeError):
@@ -90,8 +95,8 @@ class TestResizeDispatch:
         model = resized_em_model(tie)
         with pytest.raises(RuntimeError, match="once"):
             model.resize_token_embeddings(NEW_VOCAB + 4)
-        with pytest.raises(ValueError, match="new tokens"):
-            EMModel(tiny_model(tie)).resize_token_embeddings(ORIG_VOCAB)
+        with pytest.raises(ValueError, match="original vocab"):
+            EMModel(tiny_model(tie), N_NEW).resize_token_embeddings(N_NEW)
 
     def test_plain_model_resize_is_stock(self, tie):
         model = tiny_model(tie)
@@ -172,6 +177,42 @@ class TestSaveMerged:
             assert (
                 reloaded.get_input_embeddings().weight
                 is reloaded.get_output_embeddings().weight
+            )
+
+
+class TestPaddedVocab:
+    """Qwen-style checkpoints pad the embedding matrix beyond the tokenizer
+    (152064 rows vs 151665 entries), so new token ids land below the matrix
+    row count and the resize shrinks rather than grows."""
+
+    def test_boundary_from_n_new_not_matrix(self, tmp_path):
+        model = EMModel(tiny_model(False), 6)   # matrix 64, tokenizer had 56
+        model.resize_token_embeddings(62)
+        model.eval()
+        assert model.orig_vocab_size == 56
+        assert model.base.get_input_embeddings().weight.shape[0] == 62
+        assert model.new_embed.weight.shape == (6, 16)
+        assert torch.equal(
+            model.new_embed.weight, model.base.get_input_embeddings().weight[56:]
+        )
+
+        torch.manual_seed(1)
+        ids = torch.randint(0, 56, (2, 10))
+        ids[:, 3] = 56
+        ids[:, 7] = 61
+        with torch.no_grad():
+            out = model(input_ids=ids, labels=ids.clone())
+            ref = model.base(input_ids=ids, labels=ids.clone())
+        assert out.logits.shape == (2, 10, 62)
+        assert torch.allclose(out.logits, ref.logits, atol=1e-6)
+        assert torch.allclose(out.loss, ref.loss, atol=1e-6)
+
+        model.save_merged(str(tmp_path))
+        reloaded = AutoModelForCausalLM.from_pretrained(tmp_path).eval()
+        assert reloaded.config.vocab_size == 62
+        with torch.no_grad():
+            assert torch.allclose(
+                model(input_ids=ids).logits, reloaded(input_ids=ids).logits, atol=1e-5
             )
 
 

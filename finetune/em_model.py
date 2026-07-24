@@ -14,14 +14,20 @@ class EMModel(nn.Module):
     separate tables (built by resize_token_embeddings) so the E and M phases
     can be gated per-module via set_phase."""
 
-    def __init__(self, base: PreTrainedModel):
+    def __init__(self, base: PreTrainedModel, n_new_tokens: int):
         super().__init__()
         if isinstance(base, PeftModel):
             raise ValueError("EM training is incompatible with LoRA/QLoRA models.")
         if getattr(base, "is_quantized", False):
             raise ValueError("EM training is incompatible with quantized models.")
+        if n_new_tokens < 1:
+            raise ValueError(f"EM training requires new tokens, got n_new_tokens={n_new_tokens}.")
         self.base = base
-        self.orig_vocab_size = base.get_input_embeddings().weight.shape[0]
+        self.n_new_tokens = n_new_tokens
+        # Set at resize as new_num_tokens - n_new_tokens. Padded vocabs (Qwen:
+        # 152064 matrix rows vs 151665 tokenizer entries) place new ids below
+        # the matrix row count, so the boundary cannot come from the matrix shape.
+        self.orig_vocab_size = None
         self.tied = None
 
     def __getattr__(self, name):
@@ -33,14 +39,15 @@ class EMModel(nn.Module):
     def resize_token_embeddings(self, new_num_tokens: int):
         if self.tied is not None:
             raise RuntimeError("EMModel.resize_token_embeddings can only be called once.")
-        if new_num_tokens <= self.orig_vocab_size:
+        if new_num_tokens <= self.n_new_tokens:
             raise ValueError(
-                f"EM training requires new tokens: new_num_tokens={new_num_tokens} "
-                f"<= original vocab size {self.orig_vocab_size}."
+                f"new_num_tokens={new_num_tokens} leaves no original vocab below "
+                f"the {self.n_new_tokens} new tokens."
             )
 
         self.base.resize_token_embeddings(new_num_tokens)
-        n_new = new_num_tokens - self.orig_vocab_size
+        self.orig_vocab_size = new_num_tokens - self.n_new_tokens
+        n_new = self.n_new_tokens
         embed_weight = self.base.get_input_embeddings().weight
         dim = embed_weight.shape[1]
         factory = dict(dtype=embed_weight.dtype, device=embed_weight.device)
