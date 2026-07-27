@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -6,6 +7,62 @@ from transformers import Trainer, TrainerCallback, get_scheduler
 
 from finetune.sft_types import EMConfig
 from finetune.utils.setup_model import print_trainable_parameters
+
+
+@dataclass(frozen=True)
+class PhaseStepMap:
+    """Maps the global optimizer-step axis onto each phase's own timeline.
+
+    Built once from training_sequence + num_training_steps; a pure function of
+    the global step thereafter (no mutable state), so resume-from-checkpoint
+    reproduces every LR for free. Epoch i spans global steps
+    [bounds[i], bounds[i + 1]) and runs phase sequence[i]. A phase's own
+    timeline advances only on its own steps and holds flat while the other
+    phase runs — this is what lets a phase's schedule skip the intervening
+    opposite phase and resume where it left off.
+    """
+
+    sequence: str  # phases per epoch, e.g. "EMEM"
+    bounds: tuple  # len = num_epochs + 1; bounds[0] = 0, bounds[-1] = total
+    totals: dict  # own step count per phase, {"E": int, "M": int}
+
+    def phase_of(self, step: int) -> str:
+        """Phase of the epoch that global `step` falls in (last phase for any
+        step at/beyond the final boundary)."""
+        for i in range(len(self.sequence)):
+            if step < self.bounds[i + 1]:
+                return self.sequence[i]
+        return self.sequence[-1]
+
+    def own_elapsed(self, phase: str, step: int) -> int:
+        """Number of `phase` steps strictly before global `step` — the 0-based
+        position along `phase`'s own timeline. Increments only within `phase`'s
+        epochs and stays flat across the other phase's steps."""
+        n = 0
+        for i, ph in enumerate(self.sequence):
+            if ph != phase:
+                continue
+            lo, hi = self.bounds[i], self.bounds[i + 1]
+            n += max(0, min(hi, step) - lo)
+        return n
+
+
+def build_phase_step_map(
+    training_sequence: str, num_training_steps: int
+) -> PhaseStepMap:
+    """Precompute the epoch->global-step boundaries and per-phase totals for a
+    training_sequence. Boundaries match create_optimizer/scheduler's existing
+    even split: epoch i spans [round(i·N/E), round((i+1)·N/E))."""
+    seq = training_sequence.upper()
+    num_epochs = len(seq)
+    bounds = tuple(
+        round(i * num_training_steps / num_epochs) for i in range(num_epochs + 1)
+    )
+    totals = {
+        ph: sum(bounds[i + 1] - bounds[i] for i, p in enumerate(seq) if p == ph)
+        for ph in ("E", "M")
+    }
+    return PhaseStepMap(sequence=seq, bounds=bounds, totals=totals)
 
 
 class _PhaseCallback(TrainerCallback):
