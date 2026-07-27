@@ -109,11 +109,6 @@ class EMTrainer(Trainer):
             if em_config is not None and em_config.m_learning_rate is not None
             else lr
         )
-        self._reset_ranks = (
-            list(em_config.epochs_lr_scheduler_resets)
-            if em_config is not None and em_config.epochs_lr_scheduler_resets
-            else []
-        )
         self.add_callback(_PhaseCallback(self))
 
     def phase_for_epoch(self, epoch: int) -> str:
@@ -193,52 +188,47 @@ class EMTrainer(Trainer):
         return self.optimizer
 
     def create_scheduler(self, num_training_steps, optimizer=None):
-        """Segment-wise scheduler restarts (the scheduler twin of
-        create_optimizer). em_config.epochs_lr_scheduler_resets cuts training
-        into segments at the given 0-based epoch ranks; each segment gets a
-        fresh schedule of train_args.lr_scheduler_type — its own warmup
-        (warmup_ratio x segment steps) and its own decay over the segment. The
-        LR factor is a pure function of the global step and the precomputed
-        segment boundaries, so resume-from-checkpoint reproduces the same LR for
-        free. Because frozen params never step, a reset re-warms only the group
-        entering its phase; the frozen group's LR is inert. No resets -> the
-        stock single global schedule, byte-for-byte."""
-        if self.lr_scheduler is not None or not self._reset_ranks:
+        """Per-phase LR schedules with memory. Each phase (E, M) gets its own
+        warmup->decay over its *own* total steps, evaluated through
+        PhaseStepMap so the factor advances only on that phase's steps and
+        holds flat across the other — a later same-phase epoch continues the
+        schedule rather than re-warming. One lambda per param group in
+        create_optimizer's order (group 0 = table(s) at e_lr, groups 1-2 = M
+        surface at m_lr). Pure in the global step, so resume reproduces the
+        LR for free."""
+        if self.lr_scheduler is not None:
             return super().create_scheduler(num_training_steps, optimizer)
         optimizer = optimizer if optimizer is not None else self.optimizer
-        num_epochs = len(self.training_sequence)
-        bounds = [round(r * num_training_steps / num_epochs) for r in self._reset_ranks]
-        segments = list(zip([0] + bounds, bounds + [num_training_steps]))
+        step_map = build_phase_step_map(self.training_sequence, num_training_steps)
 
-        # One sub-schedule per segment. Built on a throwaway optimizer so its
-        # construction never touches the real param-group LRs; we keep only the
-        # step->factor lambda, which is base-LR-independent.
-        seg_lambdas = []
-        for start, end in segments:
-            seg_len = max(1, end - start)
+        # One warmup->decay factor per phase over that phase's own step count,
+        # built on a throwaway optimizer so construction never touches the real
+        # param-group LRs; we keep only the step->factor lambda (base-LR-free).
+        phase_lambdas = {}
+        for ph in ("E", "M"):
+            phase_len = max(1, step_map.totals[ph])
             dummy = torch.optim.SGD([torch.zeros(1, requires_grad=True)], lr=1.0)
             sub = get_scheduler(
                 self.args.lr_scheduler_type,
                 dummy,
-                num_warmup_steps=self.args.get_warmup_steps(seg_len),
-                num_training_steps=seg_len,
+                num_warmup_steps=self.args.get_warmup_steps(phase_len),
+                num_training_steps=phase_len,
                 scheduler_specific_kwargs=self.args.lr_scheduler_kwargs,
             )
             if not hasattr(sub, "lr_lambdas"):
                 raise ValueError(
-                    f"epochs_lr_scheduler_resets needs a LambdaLR-family "
+                    f"EM per-phase scheduling needs a LambdaLR-family "
                     f"lr_scheduler_type; '{self.args.lr_scheduler_type}' is not one."
                 )
-            seg_lambdas.append(sub.lr_lambdas[0])
+            phase_lambdas[ph] = sub.lr_lambdas[0]
 
-        def lr_lambda(step):
-            for (start, end), fn in zip(segments, seg_lambdas):
-                if step < end:
-                    return fn(step - start)
-            start, end = segments[-1]
-            return seg_lambdas[-1](end - start)
+        def phase_factor(phase):
+            fn = phase_lambdas[phase]
+            return lambda step: fn(step_map.own_elapsed(phase, step))
 
-        self.lr_scheduler = LambdaLR(optimizer, lr_lambda)
+        # Group order mirrors create_optimizer: [E table, M decay, M no-decay].
+        group_lambdas = [phase_factor("E"), phase_factor("M"), phase_factor("M")]
+        self.lr_scheduler = LambdaLR(optimizer, group_lambdas)
         self._created_lr_scheduler = True
         return self.lr_scheduler
 
