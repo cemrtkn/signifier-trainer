@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -6,6 +7,62 @@ from transformers import Trainer, TrainerCallback, get_scheduler
 
 from finetune.sft_types import EMConfig
 from finetune.utils.setup_model import print_trainable_parameters
+
+
+@dataclass(frozen=True)
+class PhaseStepMap:
+    """Maps the global optimizer-step axis onto each phase's own timeline.
+
+    Built once from training_sequence + num_training_steps; a pure function of
+    the global step thereafter (no mutable state), so resume-from-checkpoint
+    reproduces every LR for free. Epoch i spans global steps
+    [bounds[i], bounds[i + 1]) and runs phase sequence[i]. A phase's own
+    timeline advances only on its own steps and holds flat while the other
+    phase runs — this is what lets a phase's schedule skip the intervening
+    opposite phase and resume where it left off.
+    """
+
+    sequence: str  # phases per epoch, e.g. "EMEM"
+    bounds: tuple  # len = num_epochs + 1; bounds[0] = 0, bounds[-1] = total
+    totals: dict  # own step count per phase, {"E": int, "M": int}
+
+    def phase_of(self, step: int) -> str:
+        """Phase of the epoch that global `step` falls in (last phase for any
+        step at/beyond the final boundary)."""
+        for i in range(len(self.sequence)):
+            if step < self.bounds[i + 1]:
+                return self.sequence[i]
+        return self.sequence[-1]
+
+    def own_elapsed(self, phase: str, step: int) -> int:
+        """Number of `phase` steps strictly before global `step` — the 0-based
+        position along `phase`'s own timeline. Increments only within `phase`'s
+        epochs and stays flat across the other phase's steps."""
+        n = 0
+        for i, ph in enumerate(self.sequence):
+            if ph != phase:
+                continue
+            lo, hi = self.bounds[i], self.bounds[i + 1]
+            n += max(0, min(hi, step) - lo)
+        return n
+
+
+def build_phase_step_map(
+    training_sequence: str, num_training_steps: int
+) -> PhaseStepMap:
+    """Precompute the epoch->global-step boundaries and per-phase totals for a
+    training_sequence. Boundaries match create_optimizer/scheduler's existing
+    even split: epoch i spans [round(i·N/E), round((i+1)·N/E))."""
+    seq = training_sequence.upper()
+    num_epochs = len(seq)
+    bounds = tuple(
+        round(i * num_training_steps / num_epochs) for i in range(num_epochs + 1)
+    )
+    totals = {
+        ph: sum(bounds[i + 1] - bounds[i] for i, p in enumerate(seq) if p == ph)
+        for ph in ("E", "M")
+    }
+    return PhaseStepMap(sequence=seq, bounds=bounds, totals=totals)
 
 
 class _PhaseCallback(TrainerCallback):
@@ -51,11 +108,6 @@ class EMTrainer(Trainer):
             em_config.m_learning_rate
             if em_config is not None and em_config.m_learning_rate is not None
             else lr
-        )
-        self._reset_ranks = (
-            list(em_config.epochs_lr_scheduler_resets)
-            if em_config is not None and em_config.epochs_lr_scheduler_resets
-            else []
         )
         self.add_callback(_PhaseCallback(self))
 
@@ -136,52 +188,47 @@ class EMTrainer(Trainer):
         return self.optimizer
 
     def create_scheduler(self, num_training_steps, optimizer=None):
-        """Segment-wise scheduler restarts (the scheduler twin of
-        create_optimizer). em_config.epochs_lr_scheduler_resets cuts training
-        into segments at the given 0-based epoch ranks; each segment gets a
-        fresh schedule of train_args.lr_scheduler_type — its own warmup
-        (warmup_ratio x segment steps) and its own decay over the segment. The
-        LR factor is a pure function of the global step and the precomputed
-        segment boundaries, so resume-from-checkpoint reproduces the same LR for
-        free. Because frozen params never step, a reset re-warms only the group
-        entering its phase; the frozen group's LR is inert. No resets -> the
-        stock single global schedule, byte-for-byte."""
-        if self.lr_scheduler is not None or not self._reset_ranks:
+        """Per-phase LR schedules with memory. Each phase (E, M) gets its own
+        warmup->decay over its *own* total steps, evaluated through
+        PhaseStepMap so the factor advances only on that phase's steps and
+        holds flat across the other — a later same-phase epoch continues the
+        schedule rather than re-warming. One lambda per param group in
+        create_optimizer's order (group 0 = table(s) at e_lr, groups 1-2 = M
+        surface at m_lr). Pure in the global step, so resume reproduces the
+        LR for free."""
+        if self.lr_scheduler is not None:
             return super().create_scheduler(num_training_steps, optimizer)
         optimizer = optimizer if optimizer is not None else self.optimizer
-        num_epochs = len(self.training_sequence)
-        bounds = [round(r * num_training_steps / num_epochs) for r in self._reset_ranks]
-        segments = list(zip([0] + bounds, bounds + [num_training_steps]))
+        step_map = build_phase_step_map(self.training_sequence, num_training_steps)
 
-        # One sub-schedule per segment. Built on a throwaway optimizer so its
-        # construction never touches the real param-group LRs; we keep only the
-        # step->factor lambda, which is base-LR-independent.
-        seg_lambdas = []
-        for start, end in segments:
-            seg_len = max(1, end - start)
+        # One warmup->decay factor per phase over that phase's own step count,
+        # built on a throwaway optimizer so construction never touches the real
+        # param-group LRs; we keep only the step->factor lambda (base-LR-free).
+        phase_lambdas = {}
+        for ph in ("E", "M"):
+            phase_len = max(1, step_map.totals[ph])
             dummy = torch.optim.SGD([torch.zeros(1, requires_grad=True)], lr=1.0)
             sub = get_scheduler(
                 self.args.lr_scheduler_type,
                 dummy,
-                num_warmup_steps=self.args.get_warmup_steps(seg_len),
-                num_training_steps=seg_len,
+                num_warmup_steps=self.args.get_warmup_steps(phase_len),
+                num_training_steps=phase_len,
                 scheduler_specific_kwargs=self.args.lr_scheduler_kwargs,
             )
             if not hasattr(sub, "lr_lambdas"):
                 raise ValueError(
-                    f"epochs_lr_scheduler_resets needs a LambdaLR-family "
+                    f"EM per-phase scheduling needs a LambdaLR-family "
                     f"lr_scheduler_type; '{self.args.lr_scheduler_type}' is not one."
                 )
-            seg_lambdas.append(sub.lr_lambdas[0])
+            phase_lambdas[ph] = sub.lr_lambdas[0]
 
-        def lr_lambda(step):
-            for (start, end), fn in zip(segments, seg_lambdas):
-                if step < end:
-                    return fn(step - start)
-            start, end = segments[-1]
-            return seg_lambdas[-1](end - start)
+        def phase_factor(phase):
+            fn = phase_lambdas[phase]
+            return lambda step: fn(step_map.own_elapsed(phase, step))
 
-        self.lr_scheduler = LambdaLR(optimizer, lr_lambda)
+        # Group order mirrors create_optimizer: [E table, M decay, M no-decay].
+        group_lambdas = [phase_factor("E"), phase_factor("M"), phase_factor("M")]
+        self.lr_scheduler = LambdaLR(optimizer, group_lambdas)
         self._created_lr_scheduler = True
         return self.lr_scheduler
 

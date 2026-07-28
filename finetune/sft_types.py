@@ -1,5 +1,5 @@
 import re
-from typing import Any, Optional, List
+from typing import Any, Optional
 
 from pydantic import (
     BaseModel,
@@ -19,9 +19,6 @@ class EMConfig(BaseModel):
     training_sequence: Optional[str] = None
     e_learning_rate: Optional[float] = None
     m_learning_rate: Optional[float] = None
-    # 0-based epoch ranks that cut training into segments, each with a fresh
-    # scheduler (own warmup + decay); None/[] -> one global schedule.
-    epochs_lr_scheduler_resets: Optional[List[int]] = None
 
     @field_validator("training_sequence")
     @classmethod
@@ -32,28 +29,6 @@ class EMConfig(BaseModel):
                 "characters, e.g. 'em', 'emem', 'meme'."
             )
         return v
-
-    @model_validator(mode="after")
-    def _check_resets(self) -> "EMConfig":
-        resets = self.epochs_lr_scheduler_resets
-        if not resets:
-            return self
-        # num_epochs is len(training_sequence); the trainer defaults it to "em".
-        num_epochs = len(self.training_sequence or "em")
-        if list(resets) != sorted(set(resets)):
-            raise ValueError(
-                "epochs_lr_scheduler_resets must be strictly increasing with no "
-                f"duplicates (got {resets})."
-            )
-        for r in resets:
-            if not 1 <= r <= num_epochs - 1:
-                raise ValueError(
-                    f"epochs_lr_scheduler_resets rank {r} out of range "
-                    f"[1, {num_epochs - 1}] for a {num_epochs}-epoch run; a reset "
-                    "marks the start of a mid-run epoch, so 0 and the epoch count "
-                    "are not valid boundaries."
-                )
-        return self
 
 
 class TrainingConfig(BaseModel):
@@ -81,13 +56,11 @@ class TrainingConfig(BaseModel):
                 em.e_learning_rate is not None
                 or em.m_learning_rate is not None
                 or em.training_sequence is not None
-                or em.epochs_lr_scheduler_resets is not None
             ):
                 raise ValueError(
                     "em_config.e_learning_rate / m_learning_rate / training_sequence "
-                    "/ epochs_lr_scheduler_resets are set but em_config.status is "
-                    "false; enable status or drop them (they would otherwise be "
-                    "silently ignored)."
+                    "are set but em_config.status is false; enable status or drop "
+                    "them (they would otherwise be silently ignored)."
                 )
             return self
         if (
