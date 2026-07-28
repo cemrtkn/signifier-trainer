@@ -14,7 +14,7 @@ import torch
 from transformers import Qwen2Config, Qwen2ForCausalLM, Trainer
 
 from finetune.em_model import EMModel
-from finetune.em_trainer import EMTrainer, _PhaseCallback
+from finetune.em_trainer import EMTrainer, _PhaseCallback, build_phase_step_map
 from finetune.sft_types import EMConfig, TrainingConfig
 
 ORIG_VOCAB = 64
@@ -144,43 +144,6 @@ class TestEMConfigValidation:
 
     def test_absent_em_config_is_none(self):
         assert TrainingConfig(**base_cfg()).em_config is None
-
-    @pytest.mark.parametrize(
-        "seq,resets", [("em", [1]), ("emem", [1, 2, 3]), ("emem", [2])]
-    )
-    def test_resets_valid(self, seq, resets):
-        cfg = EMConfig(
-            status=True, training_sequence=seq, epochs_lr_scheduler_resets=resets
-        )
-        assert cfg.epochs_lr_scheduler_resets == resets
-
-    def test_resets_default_none(self):
-        assert EMConfig(status=True).epochs_lr_scheduler_resets is None
-
-    @pytest.mark.parametrize(
-        "seq,resets",
-        [("em", [0]), ("em", [2]), ("emem", [4]), ("em", [1, 2])],
-    )
-    def test_resets_out_of_range_rejected(self, seq, resets):
-        with pytest.raises(ValueError, match="out of range"):
-            EMConfig(
-                status=True, training_sequence=seq, epochs_lr_scheduler_resets=resets
-            )
-
-    @pytest.mark.parametrize("resets", [[2, 1], [1, 1]])
-    def test_resets_unsorted_or_dup_rejected(self, resets):
-        with pytest.raises(ValueError, match="strictly increasing"):
-            EMConfig(
-                status=True, training_sequence="emem", epochs_lr_scheduler_resets=resets
-            )
-
-    def test_resets_without_status_rejected(self):
-        with pytest.raises(ValueError, match="status"):
-            TrainingConfig(
-                **base_cfg(
-                    em_config={"status": False, "epochs_lr_scheduler_resets": [1]}
-                )
-            )
 
 
 class TestPhaseSchedule:
@@ -321,13 +284,40 @@ class TestLogLr:
         assert "learning_rate" not in logs
 
 
+class TestPhaseStepMap:
+    """The pure step->phase-timeline map that gives each phase its memory."""
+
+    def test_emem_own_timeline_pauses_and_continues(self):
+        # emem over 40 steps: epochs [0,10) E, [10,20) M, [20,30) E, [30,40) M.
+        m = build_phase_step_map("emem", 40)
+        assert m.totals == {"E": 20, "M": 20}
+        # E advances 0..9 in its first epoch, holds flat across the M epoch,
+        # then *continues* 10..19 in the second E (not restart, not the M tail).
+        assert m.own_elapsed("E", 9) == 9
+        assert m.own_elapsed("E", 10) == m.own_elapsed("E", 19) == 10  # held
+        assert m.own_elapsed("E", 20) == 10 and m.own_elapsed("E", 29) == 19
+        # M is symmetric: flat until its first epoch, then continues across E.
+        assert m.own_elapsed("M", 9) == 0
+        assert m.own_elapsed("M", 19) == 9
+        assert m.own_elapsed("M", 20) == m.own_elapsed("M", 29) == 10  # held
+        assert m.own_elapsed("M", 39) == 19
+        assert [m.phase_of(s) for s in (0, 10, 20, 30)] == ["E", "M", "E", "M"]
+
+    def test_uneven_split_totals_sum_to_steps(self):
+        m = build_phase_step_map("emem", 37)
+        assert m.totals["E"] + m.totals["M"] == 37
+
+
 class TestCreateScheduler:
-    def _make(self, resets, seq="em", warmup=2):
+    def _make(self, seq="em", warmup=2):
         t = EMTrainer.__new__(EMTrainer)
         t.lr_scheduler = None
         t.training_sequence = seq
-        t._reset_ranks = resets
-        t.optimizer = torch.optim.SGD([torch.zeros(1, requires_grad=True)], lr=1.0)
+        # Three groups mirror create_optimizer (E table, M decay, M no-decay);
+        # LambdaLR needs one base group per phase lambda. base lr 1.0 so each
+        # sched.lr_lambdas[i] is the bare factor.
+        params = [torch.nn.Parameter(torch.zeros(1)) for _ in range(3)]
+        t.optimizer = torch.optim.SGD([{"params": [p], "lr": 1.0} for p in params])
         t.args = SimpleNamespace(
             lr_scheduler_type="linear",
             lr_scheduler_kwargs={},
@@ -335,37 +325,62 @@ class TestCreateScheduler:
         )
         return t
 
-    def test_empty_resets_delegates_to_stock(self):
-        t = self._make([])
+    def test_preset_scheduler_delegates_to_stock(self):
+        t = self._make()
+        t.lr_scheduler = "already-set"
         sentinel = object()
         with patch.object(
             Trainer, "create_scheduler", lambda self, n, o=None: sentinel
         ):
             assert t.create_scheduler(20) is sentinel
 
-    def test_reset_restarts_warmup_at_segment_boundary(self):
-        # [1] on a 2-epoch, 20-step run: boundary at step 10. Each segment
-        # linear-warms 2 steps then decays to ~0 by its end.
-        t = self._make([1], warmup=2)
+    def test_em_each_phase_warms_and_decays_over_its_own_epoch(self):
+        # Single cycle, 20 steps: E owns [0,10), M owns [10,20). Each phase
+        # warms 2 steps then decays over its own epoch — the sensible default
+        # that used to require an explicit reset at the E->M boundary.
+        t = self._make(seq="em", warmup=2)
         sched = t.create_scheduler(20)
-        fn = sched.lr_lambdas[0]
-        # segment 1: warmup 0 -> 1.0 over steps 0..2, decay to ~0 at step 9
-        assert fn(0) == pytest.approx(0.0)
-        assert fn(2) == pytest.approx(1.0)
-        assert fn(9) < 0.2
-        # segment 2 restarts: step 10 is a fresh warmup start, peak at 12
-        assert fn(10) == pytest.approx(0.0)
-        assert fn(12) == pytest.approx(1.0)
-        assert fn(19) < 0.2
+        fn_e, fn_m = sched.lr_lambdas[0], sched.lr_lambdas[1]
+        # E: warmup peak at step 2, decaying (still > 0) by the end of its epoch.
+        assert fn_e(0) == pytest.approx(0.0)
+        assert fn_e(2) == pytest.approx(1.0)
+        assert 0.0 < fn_e(9) < 1.0
+        # M does NOT inherit E's decay: it holds at its warmup start through the
+        # E epoch, then warms fresh over its own epoch (peak at step 12).
+        assert fn_m(9) == pytest.approx(0.0)
+        assert fn_m(10) == pytest.approx(0.0)
+        assert fn_m(12) == pytest.approx(1.0)
+        assert 0.0 < fn_m(19) < 1.0
 
-    def test_lr_lambda_is_pure_function_of_step(self):
+    def test_emem_phase_schedules_have_memory(self):
+        # emem over 40 steps. E owns [0,10)+[20,30); M owns [10,20)+[30,40).
+        t = self._make(seq="emem", warmup=2)
+        sched = t.create_scheduler(40)
+        fn_e, fn_m = sched.lr_lambdas[0], sched.lr_lambdas[1]
+        # E group lambda == M group lambda for the two M param groups.
+        assert sched.lr_lambdas[1] is not sched.lr_lambdas[2]
+        # E holds flat across the intervening M epoch...
+        assert fn_e(10) == pytest.approx(fn_e(15)) == pytest.approx(fn_e(19))
+        # ...and the 2nd E *continues* the 1st E's decay: it resumes exactly at
+        # the paused value, below where the 1st E ended, and is not a re-warmup
+        # to the peak nor the fully-decayed tail.
+        assert fn_e(20) == pytest.approx(fn_e(19))
+        assert fn_e(20) < fn_e(9)
+        assert 0.0 < fn_e(20) < fn_e(2)
+        # M is symmetric: flat across the 2nd E epoch, 2nd M continues the decay.
+        assert fn_m(20) == pytest.approx(fn_m(25)) == pytest.approx(fn_m(29))
+        assert fn_m(30) == pytest.approx(fn_m(29))
+        assert 0.0 < fn_m(30) < fn_m(12)
+
+    def test_lr_lambdas_are_pure_functions_of_step(self):
         # Resume safety: same global step -> same factor, no hidden state.
-        t = self._make([1], warmup=2)
-        fn = t.create_scheduler(20).lr_lambdas[0]
-        assert [fn(s) for s in range(20)] == [fn(s) for s in range(20)]
+        t = self._make(seq="emem", warmup=2)
+        sched = t.create_scheduler(40)
+        for fn in sched.lr_lambdas:
+            assert [fn(s) for s in range(40)] == [fn(s) for s in range(40)]
 
     def test_unsupported_scheduler_type_rejected(self):
-        t = self._make([1])
+        t = self._make()
         t.args.lr_scheduler_type = "reduce_lr_on_plateau"
         with pytest.raises(ValueError, match="LambdaLR-family"):
             t.create_scheduler(20)
