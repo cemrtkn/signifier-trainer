@@ -43,6 +43,8 @@ class TrainingConfig(BaseModel):
     peft_config: Optional[PeftConfig] = None
     quantization: Optional[QuantizationConfig] = None
     em_config: Optional[EMConfig] = None
+    embedding_lr: Optional[float] = None
+    model_lr: Optional[float] = None
     output_dir_root: Optional[str] = None
     run_profiler: bool = False
     use_flash_attention: Optional[bool] = True
@@ -79,6 +81,35 @@ class TrainingConfig(BaseModel):
                 "EM training requires train_dataset_config signifier mode "
                 f"'token_signifier' (got '{signifier.mode}'): there must be new "
                 "tokens to E-step on."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_dual_lr(self) -> "TrainingConfig":
+        if self.embedding_lr is None and self.model_lr is None:
+            return self
+        if self.embedding_lr is None or self.model_lr is None:
+            raise ValueError(
+                "dual-lr SFT needs both embedding_lr and model_lr — set both, or "
+                "neither (a lone rate would leave the other half of the model on "
+                "train_args.learning_rate, which is not what you meant)."
+            )
+        if self.em_config is not None and self.em_config.status:
+            raise ValueError(
+                "embedding_lr / model_lr excludes EM training "
+                "(em_config.status: true), which carries its own per-phase rates "
+                "in em_config.e_learning_rate / m_learning_rate — drop one or the "
+                "other."
+            )
+        if (
+            self.peft_config is not None
+            or self.quantization is not None
+            or self.partial_fine_tuning is not None
+        ):
+            raise ValueError(
+                "dual-lr SFT (embedding_lr / model_lr) is full-FT only and "
+                "excludes LoRA/QLoRA (peft_config), quantization, and "
+                "partial_fine_tuning — unset them or drop the two rates."
             )
         return self
 
