@@ -14,6 +14,16 @@ class DualLRTrainer(Trainer):
         self.model_lr = model_lr
         super().__init__(*args, **kwargs)
 
+    def log(self, logs, *args, **kwargs):
+        """Log both lrs; repoint 'learning_rate' at the backbone (stock Trainer
+        reports group 0, which is the embedding group here)."""
+        if self.optimizer is not None and len(self.optimizer.param_groups) >= 2:
+            logs["lr_embed"] = self.optimizer.param_groups[0]["lr"]
+            logs["lr_model"] = self.optimizer.param_groups[1]["lr"]
+            if "learning_rate" in logs:
+                logs["learning_rate"] = logs["lr_model"]
+        return super().log(logs, *args, **kwargs)
+
     def create_optimizer(self):
         """One optimizer with the input + output embedding matrices at
         embedding_lr, everything else at model_lr split into decay / no-decay
