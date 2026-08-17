@@ -85,19 +85,23 @@ class _PhaseCallback(TrainerCallback):
 
 class _StepPhaseCallback(TrainerCallback):
     """Sets the EMModel phase from step windows over the whole run, for
-    em_config.phase_unit == "steps". The map is built at train begin, the first
-    point where state.max_steps holds the Trainer's resolved total step count
-    (from num_train_epochs or max_steps); the phase is a pure function of
-    state.global_step thereafter, so resume needs no extra state."""
+    em_config.phase_unit == "steps". The map is the one create_scheduler stored
+    on the trainer (Trainer builds the scheduler before firing on_train_begin,
+    both off the same resolved total step count), so flips and LR curves share
+    one instance; it is rebuilt from state.max_steps only if the scheduler path
+    was bypassed. The phase is a pure function of state.global_step, so resume
+    needs no extra state."""
 
     def __init__(self, trainer: "EMTrainer"):
         self._trainer = trainer
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
-        step_map = build_phase_step_map(
-            self._trainer.training_sequence, state.max_steps
-        )
-        self._trainer._step_map = step_map
+        step_map = self._trainer._step_map
+        if step_map is None:
+            step_map = build_phase_step_map(
+                self._trainer.training_sequence, state.max_steps
+            )
+            self._trainer._step_map = step_map
         phase = step_map.phase_of(state.global_step)
         self._trainer._current_phase = phase
         model.set_phase(phase)
@@ -126,6 +130,11 @@ class EMTrainer(Trainer):
     """Stock Trainer plus E/M phase switching (from em_config.training_sequence,
     one phase per epoch or per step window depending on em_config.phase_unit),
     phase-scaled optimizer param groups, and a merged final save."""
+
+    # Class defaults so both are always readable; __init__ sets the configured
+    # value, and create_scheduler fills _step_map in steps mode.
+    phase_unit = "epoch"
+    _step_map = None
 
     def __init__(self, *args, em_config: Optional[EMConfig] = None, **kwargs):
         seq = (em_config.training_sequence if em_config else None) or "em"
@@ -243,11 +252,22 @@ class EMTrainer(Trainer):
         schedule rather than re-warming. One lambda per param group in
         create_optimizer's order (group 0 = table(s) at e_lr, groups 1-2 = M
         surface at m_lr). Pure in the global step, so resume reproduces the
-        LR for free."""
+        LR for free. In steps mode the map is stored on the trainer so the
+        step-phase callback flips on these very boundaries."""
         if self.lr_scheduler is not None:
             return super().create_scheduler(num_training_steps, optimizer)
         optimizer = optimizer if optimizer is not None else self.optimizer
-        step_map = build_phase_step_map(self.training_sequence, num_training_steps)
+        step_map = self._step_map
+        if step_map is None:
+            step_map = build_phase_step_map(self.training_sequence, num_training_steps)
+            if self.phase_unit == "steps":
+                self._step_map = step_map
+        elif step_map.bounds[-1] != num_training_steps:
+            raise ValueError(
+                f"EM phase step map spans {step_map.bounds[-1]} steps but the "
+                f"scheduler was asked for {num_training_steps}; phase flips and "
+                f"LR curves would disagree."
+            )
 
         # One warmup->decay factor per phase over that phase's own step count,
         # built on a throwaway optimizer so construction never touches the real
