@@ -14,7 +14,12 @@ import torch
 from transformers import Qwen2Config, Qwen2ForCausalLM, Trainer
 
 from finetune.em_model import EMModel
-from finetune.em_trainer import EMTrainer, _PhaseCallback, build_phase_step_map
+from finetune.em_trainer import (
+    EMTrainer,
+    _PhaseCallback,
+    _StepPhaseCallback,
+    build_phase_step_map,
+)
 from finetune.sft_types import EMConfig, TrainingConfig
 
 ORIG_VOCAB = 64
@@ -52,6 +57,27 @@ def base_cfg(**over):
     )
     cfg.update(over)
     return cfg
+
+
+class PhaseRecorder:
+    """Stands in for an EMModel where only the phase call order matters;
+    named_parameters() is what print_trainable_parameters walks."""
+
+    def __init__(self):
+        self.calls = []
+
+    def set_phase(self, phase):
+        self.calls.append(phase)
+
+    def named_parameters(self):
+        return iter([("p", torch.nn.Parameter(torch.zeros(1)))])
+
+
+def step_state(max_steps, global_step=0, rank0=False):
+    """The slice of TrainerState the step-phase callback reads."""
+    return SimpleNamespace(
+        max_steps=max_steps, global_step=global_step, is_world_process_zero=rank0
+    )
 
 
 class TestEMConfigValidation:
@@ -145,6 +171,34 @@ class TestEMConfigValidation:
     def test_absent_em_config_is_none(self):
         assert TrainingConfig(**base_cfg()).em_config is None
 
+    def test_phase_unit_defaults_to_epoch(self):
+        assert EMConfig(status=True).phase_unit == "epoch"
+
+    def test_phase_unit_steps_accepted(self):
+        cfg = TrainingConfig(
+            **base_cfg(em_config={"status": True, "phase_unit": "steps"})
+        )
+        assert cfg.em_config.phase_unit == "steps"
+
+    @pytest.mark.parametrize("unit", ["step", "epochs", "", "EPOCH"])
+    def test_phase_unit_invalid_rejected(self, unit):
+        with pytest.raises(ValueError, match="phase_unit"):
+            EMConfig(status=True, phase_unit=unit)
+
+    def test_stray_phase_unit_when_off_rejected(self):
+        with pytest.raises(ValueError, match="status"):
+            TrainingConfig(
+                **base_cfg(em_config={"status": False, "phase_unit": "steps"})
+            )
+
+    def test_default_phase_unit_when_off_accepted(self):
+        # phase_unit is not Optional, so its default must not trip the stray
+        # -field guard the way an explicit "steps" does.
+        cfg = TrainingConfig(
+            **base_cfg(em_config={"status": False, "phase_unit": "epoch"})
+        )
+        assert cfg.em_config.status is False
+
 
 class TestPhaseSchedule:
     @pytest.mark.parametrize(
@@ -171,15 +225,17 @@ class TestInit:
             learning_rate=learning_rate,
             weight_decay=0.01,
         )
+        added = []
         with (
             patch.object(
                 Trainer,
                 "__init__",
                 lambda self, *a, **k: setattr(self, "args", k["args"]),
             ),
-            patch.object(Trainer, "add_callback", lambda self, cb: None),
+            patch.object(Trainer, "add_callback", lambda self, cb: added.append(cb)),
         ):
             t = EMTrainer(model=object(), args=targs, em_config=em_config)
+        t._added_callbacks = added
         return t, targs
 
     def test_derives_num_train_epochs_and_resolves_lrs(self):
@@ -203,6 +259,28 @@ class TestInit:
     def test_lr_fallback_to_learning_rate(self):
         t, _ = self._make(EMConfig(status=True), learning_rate=3e-6)
         assert (t.e_lr, t.m_lr) == (3e-6, 3e-6)
+
+    def test_steps_mode_leaves_num_train_epochs(self):
+        # In steps mode the general config owns the run length; an 8-phase
+        # sequence must not turn into 8 epochs.
+        em = EMConfig(status=True, training_sequence="emememem", phase_unit="steps")
+        t, targs = self._make(em, num_train_epochs=99)
+        assert targs.num_train_epochs == 99
+        assert t.phase_unit == "steps"
+        assert t._step_map is None
+        assert isinstance(t._added_callbacks[0], _StepPhaseCallback)
+
+    def test_epoch_mode_registers_epoch_callback(self):
+        t, targs = self._make(EMConfig(status=True, training_sequence="emem"))
+        assert targs.num_train_epochs == 4
+        assert t.phase_unit == "epoch"
+        assert isinstance(t._added_callbacks[0], _PhaseCallback)
+
+    def test_absent_em_config_defaults_to_epoch_mode(self):
+        t, targs = self._make(None)
+        assert t.phase_unit == "epoch"
+        assert targs.num_train_epochs == 2
+        assert isinstance(t._added_callbacks[0], _PhaseCallback)
 
 
 class TestCreateOptimizer:
@@ -308,22 +386,29 @@ class TestPhaseStepMap:
         assert m.totals["E"] + m.totals["M"] == 37
 
 
+def scheduler_trainer(seq="em", warmup=2, unit="epoch"):
+    t = EMTrainer.__new__(EMTrainer)
+    t.lr_scheduler = None
+    t.training_sequence = seq
+    t.phase_unit = unit
+    t._step_map = None
+    t._current_phase = seq[0].upper()
+    # Three groups mirror create_optimizer (E table, M decay, M no-decay);
+    # LambdaLR needs one base group per phase lambda. base lr 1.0 so each
+    # sched.lr_lambdas[i] is the bare factor.
+    params = [torch.nn.Parameter(torch.zeros(1)) for _ in range(3)]
+    t.optimizer = torch.optim.SGD([{"params": [p], "lr": 1.0} for p in params])
+    t.args = SimpleNamespace(
+        lr_scheduler_type="linear",
+        lr_scheduler_kwargs={},
+        get_warmup_steps=lambda n: warmup,
+    )
+    return t
+
+
 class TestCreateScheduler:
-    def _make(self, seq="em", warmup=2):
-        t = EMTrainer.__new__(EMTrainer)
-        t.lr_scheduler = None
-        t.training_sequence = seq
-        # Three groups mirror create_optimizer (E table, M decay, M no-decay);
-        # LambdaLR needs one base group per phase lambda. base lr 1.0 so each
-        # sched.lr_lambdas[i] is the bare factor.
-        params = [torch.nn.Parameter(torch.zeros(1)) for _ in range(3)]
-        t.optimizer = torch.optim.SGD([{"params": [p], "lr": 1.0} for p in params])
-        t.args = SimpleNamespace(
-            lr_scheduler_type="linear",
-            lr_scheduler_kwargs={},
-            get_warmup_steps=lambda n: warmup,
-        )
-        return t
+    def _make(self, seq="em", warmup=2, unit="epoch"):
+        return scheduler_trainer(seq=seq, warmup=warmup, unit=unit)
 
     def test_preset_scheduler_delegates_to_stock(self):
         t = self._make()
@@ -386,6 +471,99 @@ class TestCreateScheduler:
             t.create_scheduler(20)
 
 
+class TestSchedulerCallbackShareOneMap:
+    """Steps mode: HF's _inner_training_loop builds the scheduler *before*
+    firing on_train_begin, so create_scheduler is the one that builds and
+    stores the map and the callback must reuse that very instance — otherwise
+    the phase flips and the LR curves could disagree."""
+
+    def _make(self, seq="emem", unit="steps", warmup=2):
+        return scheduler_trainer(seq=seq, warmup=warmup, unit=unit)
+
+    def test_steps_mode_stores_map_spanning_total(self):
+        t = self._make()
+        assert t._step_map is None
+        t.create_scheduler(40)
+        assert t._step_map == build_phase_step_map("emem", 40)
+        assert t._step_map.bounds[-1] == 40
+
+    def test_callback_reuses_the_stored_map(self):
+        t = self._make()
+        t.create_scheduler(40)
+        shared = t._step_map
+        cb = _StepPhaseCallback(t)
+        cb.on_train_begin(None, step_state(40), None, model=PhaseRecorder())
+        # identity, not equality: the callback must not have rebuilt.
+        assert t._step_map is shared
+
+    def test_flips_align_with_lambda_advance(self):
+        t = self._make()
+        sched = t.create_scheduler(40)
+        fn_e, fn_m = sched.lr_lambdas[0], sched.lr_lambdas[1]
+        cb = _StepPhaseCallback(t)
+        model = PhaseRecorder()
+        state = step_state(40)
+        cb.on_train_begin(None, state, None, model=model)
+
+        flips, phases = [], []
+        for step in range(40):
+            state.global_step = step
+            prev = t._current_phase
+            cb.on_step_begin(None, state, None, model=model)
+            if t._current_phase != prev:
+                flips.append(step)
+            phases.append(t._current_phase)
+        assert flips == [10, 20, 30] == list(t._step_map.bounds[1:-1])
+
+        # The factor advance over [s, s+1] belongs to the phase that ran step
+        # s; the idle phase holds flat. A phase advancing outside its own
+        # window would mean the callback and the lambdas disagree.
+        for step in range(39):
+            d_e = fn_e(step + 1) - fn_e(step)
+            d_m = fn_m(step + 1) - fn_m(step)
+            if phases[step] == "E":
+                assert d_m == 0.0 and d_e != 0.0
+            else:
+                assert d_e == 0.0 and d_m != 0.0
+
+    def test_span_mismatch_rejected(self):
+        t = self._make()
+        t._step_map = build_phase_step_map("emem", 40)
+        with pytest.raises(ValueError) as exc:
+            t.create_scheduler(64)
+        assert "40" in str(exc.value) and "64" in str(exc.value)
+
+    def test_matching_prestored_map_reused(self):
+        t = self._make()
+        prestored = build_phase_step_map("emem", 40)
+        t._step_map = prestored
+        t.create_scheduler(40)
+        assert t._step_map is prestored
+
+    def test_epoch_mode_never_stores_a_map(self):
+        t = self._make(seq="emem", unit="epoch")
+        t.create_scheduler(40)
+        assert t._step_map is None
+        # ...so no stale map can trip the span guard on a later call.
+        t.lr_scheduler = None
+        t.create_scheduler(64)
+        assert t._step_map is None
+
+    def test_epoch_mode_lr_factors_unchanged(self):
+        # Pre-feature behaviour for "em" over 20 steps, warmup 2: each phase
+        # warms over 2 of its own steps then decays linearly over the
+        # remaining 8, holding flat outside its own epoch.
+        t = self._make(seq="em", unit="epoch")
+        sched = t.create_scheduler(20)
+        fn_e, fn_m = sched.lr_lambdas[0], sched.lr_lambdas[1]
+        expected_e = {0: 0.0, 1: 0.5, 2: 1.0, 5: 0.625, 9: 0.125, 10: 0.0, 19: 0.0}
+        expected_m = {0: 0.0, 9: 0.0, 10: 0.0, 12: 1.0, 15: 0.625, 19: 0.125}
+        for step, factor in expected_e.items():
+            assert fn_e(step) == pytest.approx(factor)
+        for step, factor in expected_m.items():
+            assert fn_m(step) == pytest.approx(factor)
+
+
 class TestPhaseCallback:
     def _trainer(self, seq="em"):
         t = EMTrainer.__new__(EMTrainer)
@@ -434,3 +612,115 @@ class TestPhaseCallback:
             model=model,
         )
         assert t._current_phase == "M"
+
+
+class TestStepPhaseCallback:
+    """phase_unit == "steps": phases are step windows over the whole run, so a
+    sequence longer than the epoch count still flips inside an epoch."""
+
+    def _trainer(self, seq="emem"):
+        t = EMTrainer.__new__(EMTrainer)
+        t.training_sequence = seq
+        t.phase_unit = "steps"
+        t._step_map = None
+        t._current_phase = seq[0].upper()
+        return t
+
+    def test_windows_and_per_step_phases(self):
+        # "emem" over 10 steps: round-split windows [0,2) [2,5) [5,8) [8,10).
+        t = self._trainer()
+        cb = _StepPhaseCallback(t)
+        model = PhaseRecorder()
+        state = step_state(10)
+        cb.on_train_begin(None, state, None, model=model)
+        assert t._step_map.bounds == (0, 2, 5, 8, 10)
+        assert t._step_map.totals == {"E": 5, "M": 5}
+        assert t._current_phase == "E" and model.calls == ["E"]
+
+        seen, flips = [], []
+        for step in range(10):
+            state.global_step = step
+            prev = t._current_phase
+            cb.on_step_begin(None, state, None, model=model)
+            if t._current_phase != prev:
+                flips.append(step)
+            seen.append(t._current_phase)
+        assert seen == list("EEMMMEEEMM")
+        assert flips == [2, 5, 8]
+        # set_phase fires once at train begin and once per boundary crossing —
+        # not on every step.
+        assert model.calls == ["E", "M", "E", "M"]
+
+    @pytest.mark.parametrize("global_step,expected", [(7, "E"), (9, "M")])
+    def test_resume_starts_in_the_current_steps_phase(self, global_step, expected):
+        t = self._trainer()
+        cb = _StepPhaseCallback(t)
+        model = PhaseRecorder()
+        cb.on_train_begin(
+            None, step_state(10, global_step=global_step), None, model=model
+        )
+        assert t._current_phase == expected
+        assert model.calls == [expected]
+
+    def test_uneven_split_boundaries(self):
+        # round(2*37/4) == round(18.5) == 18 under banker's rounding, not 19.
+        t = self._trainer()
+        cb = _StepPhaseCallback(t)
+        model = PhaseRecorder()
+        state = step_state(37)
+        cb.on_train_begin(None, state, None, model=model)
+        assert t._step_map.bounds == (0, 9, 18, 28, 37)
+
+        flips = []
+        for step in range(37):
+            state.global_step = step
+            prev = t._current_phase
+            cb.on_step_begin(None, state, None, model=model)
+            if t._current_phase != prev:
+                flips.append(step)
+        assert flips == [9, 18, 28]
+
+    def test_prestored_map_is_reused_not_rebuilt(self):
+        t = self._trainer()
+        prestored = build_phase_step_map("emem", 40)
+        t._step_map = prestored
+        cb = _StepPhaseCallback(t)
+        # max_steps disagrees on purpose: a rebuild would be visible.
+        cb.on_train_begin(None, step_state(10), None, model=PhaseRecorder())
+        assert t._step_map is prestored
+
+    def test_builds_the_map_when_scheduler_path_bypassed(self):
+        t = self._trainer()
+        cb = _StepPhaseCallback(t)
+        cb.on_train_begin(None, step_state(40), None, model=PhaseRecorder())
+        assert t._step_map == build_phase_step_map("emem", 40)
+
+    def test_real_model_grads_flip_on_the_boundary(self):
+        # "em" over 4 steps: E owns [0,2), M owns [2,4).
+        real = tiny_em(False)
+        t = self._trainer(seq="em")
+        cb = _StepPhaseCallback(t)
+        state = step_state(4)
+        cb.on_train_begin(None, state, None, model=real)
+        assert real.new_embed.weight.requires_grad
+        assert not self._layer0_trainable(real)
+
+        state.global_step = 2
+        cb.on_step_begin(None, state, None, model=real)
+        assert t._current_phase == "M"
+        assert not real.new_embed.weight.requires_grad
+        assert self._layer0_trainable(real)
+
+    def _layer0_trainable(self, model):
+        return any(
+            p.requires_grad for n, p in model.base.named_parameters() if "layers.0" in n
+        )
+
+    def test_rank0_logs_the_window_table(self, capsys):
+        t = self._trainer(seq="emememem")
+        cb = _StepPhaseCallback(t)
+        cb.on_train_begin(None, step_state(10, rank0=True), None, model=PhaseRecorder())
+        out = capsys.readouterr().out
+        assert "step-wise phases over 10 optimizer steps" in out
+        assert "phase 0: E, steps [0, 1), 1 steps" in out
+        assert "total steps per phase: E=5, M=5" in out
