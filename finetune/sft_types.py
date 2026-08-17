@@ -1,5 +1,5 @@
 import re
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import (
     BaseModel,
@@ -19,6 +19,8 @@ class EMConfig(BaseModel):
     training_sequence: Optional[str] = None
     e_learning_rate: Optional[float] = None
     m_learning_rate: Optional[float] = None
+    # boundary the phase flips on: one phase per epoch, or per step window.
+    phase_unit: Literal["epoch", "steps"] = "epoch"
 
     @field_validator("training_sequence")
     @classmethod
@@ -58,11 +60,13 @@ class TrainingConfig(BaseModel):
                 em.e_learning_rate is not None
                 or em.m_learning_rate is not None
                 or em.training_sequence is not None
+                or em.phase_unit != "epoch"
             ):
                 raise ValueError(
-                    "em_config.e_learning_rate / m_learning_rate / training_sequence "
-                    "are set but em_config.status is false; enable status or drop "
-                    "them (they would otherwise be silently ignored)."
+                    "em_config.e_learning_rate / m_learning_rate / "
+                    "training_sequence / phase_unit are set but em_config.status "
+                    "is false; enable status or drop them (they would otherwise "
+                    "be silently ignored)."
                 )
             return self
         if (
