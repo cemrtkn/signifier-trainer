@@ -83,18 +83,62 @@ class _PhaseCallback(TrainerCallback):
             print_trainable_parameters(model)
 
 
+class _StepPhaseCallback(TrainerCallback):
+    """Sets the EMModel phase from step windows over the whole run, for
+    em_config.phase_unit == "steps". The map is built at train begin, the first
+    point where state.max_steps holds the Trainer's resolved total step count
+    (from num_train_epochs or max_steps); the phase is a pure function of
+    state.global_step thereafter, so resume needs no extra state."""
+
+    def __init__(self, trainer: "EMTrainer"):
+        self._trainer = trainer
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        step_map = build_phase_step_map(
+            self._trainer.training_sequence, state.max_steps
+        )
+        self._trainer._step_map = step_map
+        phase = step_map.phase_of(state.global_step)
+        self._trainer._current_phase = phase
+        model.set_phase(phase)
+        if state.is_world_process_zero:
+            print(f"[EM] step-wise phases over {state.max_steps} optimizer steps:")
+            for i, ph in enumerate(step_map.sequence):
+                lo, hi = step_map.bounds[i], step_map.bounds[i + 1]
+                print(f"[EM]   phase {i}: {ph}, steps [{lo}, {hi}), {hi - lo} steps")
+            totals = ", ".join(f"{ph}={step_map.totals[ph]}" for ph in ("E", "M"))
+            print(f"[EM] total steps per phase: {totals}")
+            print(f"[EM] step {state.global_step} -> {phase} phase")
+            print_trainable_parameters(model)
+
+    def on_step_begin(self, args, state, control, model=None, **kwargs):
+        phase = self._trainer._step_map.phase_of(state.global_step)
+        if phase == self._trainer._current_phase:
+            return
+        self._trainer._current_phase = phase
+        model.set_phase(phase)
+        if state.is_world_process_zero:
+            print(f"[EM] step {state.global_step} -> {phase} phase")
+            print_trainable_parameters(model)
+
+
 class EMTrainer(Trainer):
-    """Stock Trainer plus per-epoch E/M phase switching (from
-    em_config.training_sequence), phase-scaled optimizer param groups, and a
-    merged final save."""
+    """Stock Trainer plus E/M phase switching (from em_config.training_sequence,
+    one phase per epoch or per step window depending on em_config.phase_unit),
+    phase-scaled optimizer param groups, and a merged final save."""
 
     def __init__(self, *args, em_config: Optional[EMConfig] = None, **kwargs):
         seq = (em_config.training_sequence if em_config else None) or "em"
         self.training_sequence = seq
+        self.phase_unit = (em_config.phase_unit if em_config else None) or "epoch"
         self._current_phase = seq[0].upper()
-        # Sequence length is the epoch count; it overrides num_train_epochs.
-        train_args = kwargs.get("args") if "args" in kwargs else args[1]
-        train_args.num_train_epochs = len(seq)
+        self._step_map = None
+        if self.phase_unit == "epoch":
+            # One phase per epoch: sequence length is the epoch count and
+            # overrides num_train_epochs. In steps mode the general config owns
+            # the run length and the sequence only splits it.
+            train_args = kwargs.get("args") if "args" in kwargs else args[1]
+            train_args.num_train_epochs = len(seq)
 
         super().__init__(*args, **kwargs)
 
@@ -109,7 +153,11 @@ class EMTrainer(Trainer):
             if em_config is not None and em_config.m_learning_rate is not None
             else lr
         )
-        self.add_callback(_PhaseCallback(self))
+        self.add_callback(
+            _PhaseCallback(self)
+            if self.phase_unit == "epoch"
+            else _StepPhaseCallback(self)
+        )
 
     def phase_for_epoch(self, epoch: int) -> str:
         """Phase for a 0-based epoch: the epoch-th character of
