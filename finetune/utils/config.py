@@ -21,12 +21,16 @@ def load_config(config: TrainingConfig | str) -> TrainingConfig:
     with open(config) as f:
         config_dict = yaml.safe_load(f)
 
-        # The line below is only needed because we use SkipValidation
+        # The lines below are only needed because we use SkipValidation
         # for the TrainingArguments field.
-        config_dict["train_args"] = TrainingArguments(**config_dict["train_args"])
+        if config_dict.get("mode") == "dpo":
+            from trl import DPOConfig
+
+            config_dict["train_args"] = DPOConfig(**config_dict["train_args"])
+        else:
+            config_dict["train_args"] = TrainingArguments(**config_dict["train_args"])
 
         # Typecast the config_dict to a TrainingConfig object.
         training_config: TrainingConfig = TrainingConfig(**config_dict)
 
         return training_config
-

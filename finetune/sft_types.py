@@ -39,6 +39,8 @@ class TrainingConfig(BaseModel):
         None,
         description="The path to the PTMP directory to save the model weights under ptmp_dir + train_args.output_dir.",
     )
+    mode: Literal["sft", "dpo"] = "sft"
+    batch_bidirectionals: bool = False
     train_args: Any
     train_dataset_config: DatasetConfig
     partial_fine_tuning: Optional[FreezeLayerConfig] = None
@@ -85,6 +87,48 @@ class TrainingConfig(BaseModel):
                 "EM training requires train_dataset_config signifier mode "
                 f"'token_signifier' (got '{signifier.mode}'): there must be new "
                 "tokens to E-step on."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_dpo(self) -> "TrainingConfig":
+        if self.mode != "dpo":
+            if self.batch_bidirectionals:
+                raise ValueError(
+                    "batch_bidirectionals requires mode: dpo — the pair-preserving "
+                    "sampler has no meaning in sft mode."
+                )
+            return self
+        if self.em_config is not None and self.em_config.status:
+            raise ValueError(
+                "mode: dpo excludes EM training for now (tracked in issue #14) — "
+                "DPO runs on a merged token checkpoint whose signifiers are "
+                "ordinary vocab rows; drop em_config or use mode: sft."
+            )
+        if self.embedding_lr is not None or self.model_lr is not None:
+            raise ValueError(
+                "mode: dpo is uniform-lr full-FT — drop embedding_lr / model_lr."
+            )
+        if (
+            self.peft_config is not None
+            or self.quantization is not None
+            or self.partial_fine_tuning is not None
+        ):
+            raise ValueError(
+                "mode: dpo is plain full-FT only — unset peft_config, "
+                "quantization, and partial_fine_tuning."
+            )
+        from transformers import TrainingArguments
+
+        from trl import DPOConfig
+
+        if isinstance(self.train_args, TrainingArguments) and not isinstance(
+            self.train_args, DPOConfig
+        ):
+            raise ValueError(
+                "mode: dpo needs train_args validated as trl's DPOConfig "
+                "(utils.config.load_config does this from YAML); got plain "
+                "TrainingArguments."
             )
         return self
 
