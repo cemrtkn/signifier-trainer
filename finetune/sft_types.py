@@ -40,7 +40,6 @@ class TrainingConfig(BaseModel):
         description="The path to the PTMP directory to save the model weights under ptmp_dir + train_args.output_dir.",
     )
     mode: Literal["sft", "dpo"] = "sft"
-    batch_bidirectionals: bool = False
     train_args: Any
     train_dataset_config: DatasetConfig
     partial_fine_tuning: Optional[FreezeLayerConfig] = None
@@ -93,11 +92,6 @@ class TrainingConfig(BaseModel):
     @model_validator(mode="after")
     def _check_dpo(self) -> "TrainingConfig":
         if self.mode != "dpo":
-            if self.batch_bidirectionals:
-                raise ValueError(
-                    "batch_bidirectionals requires mode: dpo — the pair-preserving "
-                    "sampler has no meaning in sft mode."
-                )
             return self
         if self.em_config is not None and self.em_config.status:
             raise ValueError(

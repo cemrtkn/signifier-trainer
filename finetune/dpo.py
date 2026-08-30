@@ -90,7 +90,8 @@ def run_dpo(config: TrainingConfig):
         config, tokenizer, test_fold=config.train_dataset_config.test_fold or 0
     )
 
-    if config.batch_bidirectionals:
+    batch_bidirectionals = getattr(config.train_args, "batch_bidirectionals", False)
+    if batch_bidirectionals:
         effective_batch = (
             config.train_args.per_device_train_batch_size
             * config.train_args.world_size
@@ -108,7 +109,7 @@ def run_dpo(config: TrainingConfig):
         "no" if "test" not in datasetdict else config.train_args.eval_strategy
     )
 
-    trainer_cls = PairedDPOTrainer if config.batch_bidirectionals else DPOTrainer
+    trainer_cls = PairedDPOTrainer if batch_bidirectionals else DPOTrainer
     trainer = trainer_cls(
         model=model,
         ref_model=None,

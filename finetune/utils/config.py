@@ -24,9 +24,9 @@ def load_config(config: TrainingConfig | str) -> TrainingConfig:
         # The lines below are only needed because we use SkipValidation
         # for the TrainingArguments field.
         if config_dict.get("mode") == "dpo":
-            from trl import DPOConfig
+            from finetune.dpo_config import SignifierDPOConfig
 
-            config_dict["train_args"] = DPOConfig(**config_dict["train_args"])
+            config_dict["train_args"] = SignifierDPOConfig(**config_dict["train_args"])
         else:
             config_dict["train_args"] = TrainingArguments(**config_dict["train_args"])
 
