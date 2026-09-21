@@ -320,12 +320,19 @@ class EMTrainer(Trainer):
         output_dir = output_dir if output_dir is not None else self.args.output_dir
         if self.is_fsdp_enabled:
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp import ShardingStrategy
 
+            # world size 1 auto-switches FSDP to NO_SHARD, where torch does
+            # not support offload_to_cpu (params are already whole anyway).
+            sharded = (
+                getattr(self.model_wrapped, "sharding_strategy", None)
+                != ShardingStrategy.NO_SHARD
+            )
             with FSDP.summon_full_params(
                 self.model_wrapped,
                 writeback=False,
-                rank0_only=True,
-                offload_to_cpu=True,
+                rank0_only=sharded,
+                offload_to_cpu=sharded,
             ):
                 if self.args.should_save:
                     self.model.save_merged(output_dir)

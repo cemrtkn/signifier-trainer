@@ -84,9 +84,9 @@ class TestConfigGate:
         with pytest.raises(ValueError, match="excludes EM"):
             load_yaml_config(tmp_path, cfg)
 
-    def test_dpo_excludes_dual_lr(self, tmp_path):
+    def test_removed_dual_lr_fields_rejected(self, tmp_path):
         cfg = base_config(mode="dpo", embedding_lr=1e-3, model_lr=2e-5)
-        with pytest.raises(ValueError, match="uniform-lr"):
+        with pytest.raises(ValueError, match="removed"):
             load_yaml_config(tmp_path, cfg)
 
     def test_dpo_excludes_peft(self, tmp_path):

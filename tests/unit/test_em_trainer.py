@@ -154,6 +154,10 @@ class TestEMConfigValidation:
         with pytest.raises(ValueError, match="training_sequence"):
             EMConfig(status=True, training_sequence=seq)
 
+    def test_removed_dual_lr_fields_rejected(self):
+        with pytest.raises(ValueError, match="removed"):
+            TrainingConfig(**base_cfg(embedding_lr=1e-3, model_lr=2e-5))
+
     def test_valid_em_config_accepted(self):
         cfg = TrainingConfig(
             **base_cfg(
