@@ -25,10 +25,12 @@ class EMConfig(BaseModel):
     @field_validator("training_sequence")
     @classmethod
     def _check_training_sequence(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None and not re.fullmatch(r"[em]+", v):
+        if v is not None and not re.fullmatch(r"[em]+|j", v):
             raise ValueError(
                 "training_sequence must be a non-empty string of 'e'/'m' "
-                "characters, e.g. 'em', 'emem', 'meme'."
+                "characters (e.g. 'em', 'emem', 'meme') or exactly 'j' (joint: "
+                "tables and base train together at their own LRs for the "
+                "whole run — there are no phases to sequence)."
             )
         return v
 
@@ -46,8 +48,6 @@ class TrainingConfig(BaseModel):
     peft_config: Optional[PeftConfig] = None
     quantization: Optional[QuantizationConfig] = None
     em_config: Optional[EMConfig] = None
-    embedding_lr: Optional[float] = None
-    model_lr: Optional[float] = None
     output_dir_root: Optional[str] = None
     run_profiler: bool = False
     use_flash_attention: Optional[bool] = True
@@ -99,10 +99,6 @@ class TrainingConfig(BaseModel):
                 "DPO runs on a merged token checkpoint whose signifiers are "
                 "ordinary vocab rows; drop em_config or use mode: sft."
             )
-        if self.embedding_lr is not None or self.model_lr is not None:
-            raise ValueError(
-                "mode: dpo is uniform-lr full-FT — drop embedding_lr / model_lr."
-            )
         if (
             self.peft_config is not None
             or self.quantization is not None
@@ -126,10 +122,21 @@ class TrainingConfig(BaseModel):
             )
         return self
 
-    @model_validator(mode="after")
-    def _check_dual_lr(self) -> "TrainingConfig":
-        if self.embedding_lr is None and self.model_lr is None:
-            return self
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_removed_dual_lr(cls, data):
+        """Loud failure for pre-#114 configs: TrainingConfig ignores unknown
+        keys, so a silently-dropped embedding_lr would train uniform-LR."""
+        if isinstance(data, dict) and (
+            "embedding_lr" in data or "model_lr" in data
+        ):
+            raise ValueError(
+                "embedding_lr / model_lr were removed (dual-lr trained the "
+                "whole vocab at the embedding rate) — use em_config with "
+                "training_sequence 'j' (e_learning_rate for the signifier "
+                "tables, m_learning_rate for everything else)."
+            )
+        return data
         if self.embedding_lr is None or self.model_lr is None:
             raise ValueError(
                 "dual-lr SFT needs both embedding_lr and model_lr — set both, or "

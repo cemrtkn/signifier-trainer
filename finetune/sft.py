@@ -8,7 +8,6 @@ from transformers import Trainer
 import torch.distributed as dist
 from torch.profiler import profile
 
-from finetune.dual_lr_trainer import DualLRTrainer
 from finetune.em_model import get_em_auto_wrap_policy
 from finetune.em_trainer import EMTrainer
 from finetune.sft_types import TrainingConfig
@@ -117,13 +116,6 @@ def run_sft(config: TrainingConfig):
             trainer.accelerator.state.fsdp_plugin.auto_wrap_policy = (
                 get_em_auto_wrap_policy(model)
             )
-    elif config.embedding_lr is not None:
-        print(f"Dual-lr: embeddings {config.embedding_lr}, model {config.model_lr}")
-        trainer = DualLRTrainer(
-            **trainer_kwargs,
-            embedding_lr=config.embedding_lr,
-            model_lr=config.model_lr,
-        )
     else:
         trainer = Trainer(**trainer_kwargs)
 
