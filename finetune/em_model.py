@@ -116,15 +116,18 @@ class EMModel(nn.Module):
                 n_new,
             )
 
-    def set_phase(self, phase: Literal["E", "M"]) -> None:
+    def set_phase(self, phase: Literal["E", "M", "J"]) -> None:
+        """E: only the new-token tables train. M: only the base trains.
+        J (joint): both train at once — the tables and the base keep their
+        separate optimizer groups, so per-group LRs still apply."""
         if self.tied is None:
             raise RuntimeError("EMModel.set_phase called before resize_token_embeddings.")
-        if phase not in ("E", "M"):
-            raise ValueError(f"Unknown phase {phase!r}; expected 'E' or 'M'.")
+        if phase not in ("E", "M", "J"):
+            raise ValueError(f"Unknown phase {phase!r}; expected 'E', 'M' or 'J'.")
         tables = (self.new_shared,) if self.tied else (self.new_embed, self.new_lm_head)
-        self.base.requires_grad_(phase == "M")
+        self.base.requires_grad_(phase in ("M", "J"))
         for module in tables:
-            module.requires_grad_(phase == "E")
+            module.requires_grad_(phase in ("E", "J"))
 
     def save_merged(self, output_dir: str) -> None:
         if self.tied is None:

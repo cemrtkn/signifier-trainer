@@ -25,10 +25,12 @@ class EMConfig(BaseModel):
     @field_validator("training_sequence")
     @classmethod
     def _check_training_sequence(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None and not re.fullmatch(r"[em]+", v):
+        if v is not None and not re.fullmatch(r"[em]+|j", v):
             raise ValueError(
                 "training_sequence must be a non-empty string of 'e'/'m' "
-                "characters, e.g. 'em', 'emem', 'meme'."
+                "characters (e.g. 'em', 'emem', 'meme') or exactly 'j' (joint: "
+                "tables and base train together at their own LRs for the "
+                "whole run — there are no phases to sequence)."
             )
         return v
 

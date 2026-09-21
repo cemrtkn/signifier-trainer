@@ -166,6 +166,15 @@ class TestSetPhase:
         model.set_phase("E")
         assert trainable() == table_numel
 
+    def test_joint_phase_trains_everything(self, tie):
+        model = resized_em_model(tie)
+        total_numel = sum(p.numel() for p in model.parameters())
+        model.set_phase("J")
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        assert trainable == total_numel
+        assert model.base.get_input_embeddings().weight.requires_grad
+        assert all(t.weight.requires_grad for t in tables_of(model))
+
     def test_rejects_unknown_phase(self, tie):
         with pytest.raises(ValueError, match="phase"):
             resized_em_model(tie).set_phase("X")

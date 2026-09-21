@@ -22,9 +22,9 @@ class PhaseStepMap:
     opposite phase and resume where it left off.
     """
 
-    sequence: str  # phases per epoch, e.g. "EMEM"
+    sequence: str  # phases per epoch, e.g. "EMEM" (or exactly "J" for joint)
     bounds: tuple  # len = num_epochs + 1; bounds[0] = 0, bounds[-1] = total
-    totals: dict  # own step count per phase, {"E": int, "M": int}
+    totals: dict  # own step count per phase, {"E": int, "M": int, "J": int}
 
     def phase_of(self, step: int) -> str:
         """Phase of the epoch that global `step` falls in (last phase for any
@@ -60,7 +60,7 @@ def build_phase_step_map(
     )
     totals = {
         ph: sum(bounds[i + 1] - bounds[i] for i, p in enumerate(seq) if p == ph)
-        for ph in ("E", "M")
+        for ph in ("E", "M", "J")
     }
     return PhaseStepMap(sequence=seq, bounds=bounds, totals=totals)
 
@@ -110,7 +110,9 @@ class _StepPhaseCallback(TrainerCallback):
             for i, ph in enumerate(step_map.sequence):
                 lo, hi = step_map.bounds[i], step_map.bounds[i + 1]
                 print(f"[EM]   phase {i}: {ph}, steps [{lo}, {hi}), {hi - lo} steps")
-            totals = ", ".join(f"{ph}={step_map.totals[ph]}" for ph in ("E", "M"))
+            totals = ", ".join(
+                f"{ph}={step_map.totals[ph]}" for ph in sorted(set(step_map.sequence))
+            )
             print(f"[EM] total steps per phase: {totals}")
             print(f"[EM] step {state.global_step} -> {phase} phase")
             print_trainable_parameters(model)
@@ -170,14 +172,15 @@ class EMTrainer(Trainer):
 
     def phase_for_epoch(self, epoch: int) -> str:
         """Phase for a 0-based epoch: the epoch-th character of
-        training_sequence ('e'/'m' -> 'E'/'M')."""
+        training_sequence ('e'/'m'/'j' -> 'E'/'M'/'J')."""
         return self.training_sequence[epoch].upper()
 
     def log(self, logs, *args, **kwargs):
         """Trainer logs only param-group 0's lr as 'learning_rate', and group 0
         is the e_lr table group — so the stock field reports e_lr in both
         phases (and wandb, reading the same dict, would too). Expose both group
-        scales as lr_e / lr_m and repoint 'learning_rate' at the active phase."""
+        scales as lr_e / lr_m and repoint 'learning_rate' at the active phase
+        (the backbone lr_m under the joint J phase, where both groups step)."""
         if self.optimizer is not None and len(self.optimizer.param_groups) >= 2:
             logs["lr_e"] = self.optimizer.param_groups[0]["lr"]
             logs["lr_m"] = self.optimizer.param_groups[1]["lr"]
@@ -273,7 +276,7 @@ class EMTrainer(Trainer):
         # built on a throwaway optimizer so construction never touches the real
         # param-group LRs; we keep only the step->factor lambda (base-LR-free).
         phase_lambdas = {}
-        for ph in ("E", "M"):
+        for ph in sorted(set(step_map.sequence)):
             phase_len = max(1, step_map.totals[ph])
             dummy = torch.optim.SGD([torch.zeros(1, requires_grad=True)], lr=1.0)
             sub = get_scheduler(
@@ -295,7 +298,12 @@ class EMTrainer(Trainer):
             return lambda step: fn(step_map.own_elapsed(phase, step))
 
         # Group order mirrors create_optimizer: [E table, M decay, M no-decay].
-        group_lambdas = [phase_factor("E"), phase_factor("M"), phase_factor("M")]
+        # A joint sequence is exactly "J" (validator-enforced): every group
+        # runs one shared warmup->decay over the whole run at its own base lr.
+        if "J" in step_map.sequence:
+            group_lambdas = [phase_factor("J")] * 3
+        else:
+            group_lambdas = [phase_factor("E"), phase_factor("M"), phase_factor("M")]
         self.lr_scheduler = LambdaLR(optimizer, group_lambdas)
         self._created_lr_scheduler = True
         return self.lr_scheduler

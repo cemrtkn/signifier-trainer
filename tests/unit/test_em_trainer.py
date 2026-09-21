@@ -145,11 +145,11 @@ class TestEMConfigValidation:
                 **base_cfg(em_config={"status": False, "training_sequence": "meme"})
             )
 
-    @pytest.mark.parametrize("seq", ["em", "emem", "meme", "eem"])
+    @pytest.mark.parametrize("seq", ["em", "emem", "meme", "eem", "j"])
     def test_training_sequence_valid(self, seq):
         EMConfig(status=True, training_sequence=seq)
 
-    @pytest.mark.parametrize("seq", ["emx", "", "EM", "e m"])
+    @pytest.mark.parametrize("seq", ["emx", "", "EM", "e m", "ej", "jm", "jem", "jj"])
     def test_training_sequence_invalid(self, seq):
         with pytest.raises(ValueError, match="training_sequence"):
             EMConfig(status=True, training_sequence=seq)
@@ -341,7 +341,9 @@ class TestLogLr:
         )
         return t
 
-    @pytest.mark.parametrize("phase,expected", [("E", 1e-4), ("M", 2e-6)])
+    @pytest.mark.parametrize(
+        "phase,expected", [("E", 1e-4), ("M", 2e-6), ("J", 2e-6)]
+    )
     def test_active_phase_learning_rate(self, phase, expected):
         t = self._make()
         t._current_phase = phase
@@ -368,7 +370,7 @@ class TestPhaseStepMap:
     def test_emem_own_timeline_pauses_and_continues(self):
         # emem over 40 steps: epochs [0,10) E, [10,20) M, [20,30) E, [30,40) M.
         m = build_phase_step_map("emem", 40)
-        assert m.totals == {"E": 20, "M": 20}
+        assert m.totals == {"E": 20, "M": 20, "J": 0}
         # E advances 0..9 in its first epoch, holds flat across the M epoch,
         # then *continues* 10..19 in the second E (not restart, not the M tail).
         assert m.own_elapsed("E", 9) == 9
@@ -380,6 +382,12 @@ class TestPhaseStepMap:
         assert m.own_elapsed("M", 20) == m.own_elapsed("M", 29) == 10  # held
         assert m.own_elapsed("M", 39) == 19
         assert [m.phase_of(s) for s in (0, 10, 20, 30)] == ["E", "M", "E", "M"]
+
+    def test_joint_sequence_owns_every_step(self):
+        m = build_phase_step_map("j", 20)
+        assert m.totals == {"E": 0, "M": 0, "J": 20}
+        assert m.own_elapsed("J", 13) == 13
+        assert [m.phase_of(s) for s in (0, 19)] == ["J", "J"]
 
     def test_uneven_split_totals_sum_to_steps(self):
         m = build_phase_step_map("emem", 37)
@@ -436,6 +444,18 @@ class TestCreateScheduler:
         assert fn_m(10) == pytest.approx(0.0)
         assert fn_m(12) == pytest.approx(1.0)
         assert 0.0 < fn_m(19) < 1.0
+
+    def test_joint_sequence_one_shared_schedule_for_all_groups(self):
+        # Pure-"j": all three groups follow one warmup->decay over the whole
+        # run — per-group scale differences live in the base lrs alone.
+        t = self._make(seq="j", warmup=2)
+        sched = t.create_scheduler(20)
+        fn_t, fn_d, fn_n = sched.lr_lambdas
+        for s in (0, 2, 7, 13, 19):
+            assert fn_t(s) == pytest.approx(fn_d(s)) == pytest.approx(fn_n(s))
+        assert fn_t(0) == pytest.approx(0.0)
+        assert fn_t(2) == pytest.approx(1.0)
+        assert 0.0 < fn_t(19) < 1.0
 
     def test_emem_phase_schedules_have_memory(self):
         # emem over 40 steps. E owns [0,10)+[20,30); M owns [10,20)+[30,40).
@@ -600,6 +620,17 @@ class TestPhaseCallback:
         assert not model.new_embed.weight.requires_grad
         assert self._layer0_trainable(model)
 
+    def test_joint_epoch_trains_tables_and_base(self):
+        t = self._trainer(seq="j")
+        model = tiny_em(False)
+        cb = _PhaseCallback(t)
+        state = SimpleNamespace(epoch=0.0, is_world_process_zero=False)
+        cb.on_epoch_begin(None, state, None, model=model)
+        assert t._current_phase == "J"
+        assert model.new_embed.weight.requires_grad
+        assert model.base.get_input_embeddings().weight.requires_grad
+        assert self._layer0_trainable(model)
+
     def test_float_epoch_rounds(self):
         # state.epoch drifts slightly off the integer at epoch begin.
         t = self._trainer()
@@ -634,7 +665,7 @@ class TestStepPhaseCallback:
         state = step_state(10)
         cb.on_train_begin(None, state, None, model=model)
         assert t._step_map.bounds == (0, 2, 5, 8, 10)
-        assert t._step_map.totals == {"E": 5, "M": 5}
+        assert t._step_map.totals == {"E": 5, "M": 5, "J": 0}
         assert t._current_phase == "E" and model.calls == ["E"]
 
         seen, flips = [], []
