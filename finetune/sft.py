@@ -22,6 +22,22 @@ import torch
 torch.cuda.empty_cache()
 
 
+def resize_for_new_tokens(model, n_tokens: int, em_on: bool) -> None:
+    """Resize embeddings for new tokens without ever shrinking a padded
+    vocab: tokens that fit inside existing padding rows keep the checkpoint
+    at the pre-training shape (Qwen: 152064 rows for 151665 tokens).
+    EMModel must always resize — it builds the E-phase tables, and its
+    pad_to_multiple_of restores the padded shape so it never shrinks."""
+    embed_rows = model.get_input_embeddings().weight.shape[0]
+    if em_on or n_tokens > embed_rows:
+        model.resize_token_embeddings(n_tokens)
+    else:
+        print(
+            f"{n_tokens} tokens fit in the {embed_rows} embedding rows; "
+            "keeping pre-training size."
+        )
+
+
 def run_sft(config: TrainingConfig):
     """Train a model using the given configuration.
 
@@ -65,7 +81,7 @@ def run_sft(config: TrainingConfig):
         num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
         print("Tokenizer length after extension: ", len(tokenizer))
 
-        model.resize_token_embeddings(len(tokenizer))
+        resize_for_new_tokens(model, len(tokenizer), em_on)
         if not em_on:
             # EM would show a misleading pre-phase state here; EMTrainer prints per phase.
             print("Model parameters after resizing: ")
